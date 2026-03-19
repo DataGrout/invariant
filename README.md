@@ -3,7 +3,7 @@
 **Semantic code analysis for the AI era**
 
 [![CI](https://github.com/datagrout/invariant/actions/workflows/ci.yml/badge.svg)](https://github.com/datagrout/invariant/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/invariant-cli.svg)](https://crates.io/crates/invariant-cli)
+[![crates.io](https://img.shields.io/crates/v/invariant-cli.svg?label=invariant-cli)](https://crates.io/crates/invariant-cli)
 [![crates.io](https://img.shields.io/crates/v/invariant-core.svg?label=invariant-core)](https://crates.io/crates/invariant-core)
 [![license](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](./LICENSE)
 
