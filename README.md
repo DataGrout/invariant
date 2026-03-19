@@ -150,7 +150,7 @@ cargo doc --open              # API documentation
 
 ## Powered By
 
-[DataGrout](https://datagrout.ai) — The Cognitive Integration Marketplace
+[DataGrout AI](https://datagrout.ai) — Intelligence Infrastructure for Autonomous Systems
 
 ## License
 
