@@ -1,7 +1,7 @@
-//! Conduit Bridge — connects Invariant to DataGrout Prism tools.
+//! Conduit Bridge — connects Invariant to DataGrout Invariant server-side tools.
 //!
 //! When a DataGrout gateway URL is configured, the bridge delegates to
-//! server-side Prism tools for intent-enriched code analysis, advanced
+//! server-side Invariant tools for intent-enriched code analysis, advanced
 //! Prolog queries, and diff analysis. Falls back gracefully when offline.
 //!
 //! Authentication is handled automatically by the Conduit SDK:

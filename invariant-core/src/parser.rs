@@ -20,6 +20,8 @@ pub enum Language {
     Go,
     /// Elixir
     Elixir,
+    /// Ruby
+    Ruby,
 }
 
 impl Language {
@@ -33,6 +35,7 @@ impl Language {
             "js" | "jsx" => Some(Language::JavaScript),
             "go" => Some(Language::Go),
             "ex" | "exs" => Some(Language::Elixir),
+            "rb" | "rake" | "gemspec" => Some(Language::Ruby),
             _ => None,
         }
     }
@@ -47,6 +50,7 @@ impl Language {
             Language::JavaScript => &["js", "jsx"],
             Language::Go => &["go"],
             Language::Elixir => &["ex", "exs"],
+            Language::Ruby => &["rb", "rake", "gemspec"],
         }
     }
 
@@ -59,6 +63,7 @@ impl Language {
             Language::JavaScript => "javascript",
             Language::Go => "go",
             Language::Elixir => "elixir",
+            Language::Ruby => "ruby",
         }
     }
 }
@@ -72,6 +77,7 @@ pub struct Parser {
     javascript_parser: TSParser,
     go_parser: TSParser,
     elixir_parser: TSParser,
+    ruby_parser: TSParser,
 }
 
 impl Parser {
@@ -112,6 +118,11 @@ impl Parser {
             .set_language(&tree_sitter_elixir::LANGUAGE.into())
             .map_err(|e| Error::Parse(format!("Failed to set Elixir language: {}", e)))?;
 
+        let mut ruby_parser = TSParser::new();
+        ruby_parser
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
+            .map_err(|e| Error::Parse(format!("Failed to set Ruby language: {}", e)))?;
+
         Ok(Self {
             rust_parser,
             python_parser,
@@ -120,6 +131,7 @@ impl Parser {
             javascript_parser,
             go_parser,
             elixir_parser,
+            ruby_parser,
         })
     }
 
@@ -133,6 +145,7 @@ impl Parser {
             Language::JavaScript => &mut self.javascript_parser,
             Language::Go => &mut self.go_parser,
             Language::Elixir => &mut self.elixir_parser,
+            Language::Ruby => &mut self.ruby_parser,
         };
 
         parser
@@ -213,5 +226,21 @@ mod tests {
         let code = "defmodule Hello do\n  def greet, do: :ok\nend";
         let tree = parser.parse(code, Language::Elixir);
         assert!(tree.is_ok());
+    }
+
+    #[test]
+    fn test_parse_ruby() {
+        let mut parser = Parser::new().unwrap();
+        let code = "class Greeter\n  def hello(name)\n    puts \"Hello #{name}\"\n  end\nend";
+        let tree = parser.parse(code, Language::Ruby);
+        assert!(tree.is_ok());
+        assert!(!tree.unwrap().root_node().has_error());
+    }
+
+    #[test]
+    fn test_language_ruby_from_extension() {
+        assert_eq!(Language::from_extension("rb"), Some(Language::Ruby));
+        assert_eq!(Language::from_extension("rake"), Some(Language::Ruby));
+        assert_eq!(Language::from_extension("gemspec"), Some(Language::Ruby));
     }
 }

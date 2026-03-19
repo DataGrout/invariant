@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Core
-invariant-core = { path = "../invariant-core", version = "0.1.0" }
+invariant-core = { path = "../invariant-core", version = "0.2.0" }
 
 # Async
 tokio.workspace = true

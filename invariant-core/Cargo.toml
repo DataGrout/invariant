@@ -1,6 +1,6 @@
 [package]
 name = "invariant-core"
-description = "Multi-language semantic code analysis library — tree-sitter fact extraction for DataGrout Prism"
+description = "Multi-language semantic code analysis library — tree-sitter fact extraction for DataGrout Invariant"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -23,6 +23,7 @@ tree-sitter-typescript.workspace = true
 tree-sitter-javascript.workspace = true
 tree-sitter-go.workspace = true
 tree-sitter-elixir.workspace = true
+tree-sitter-ruby.workspace = true
 
 # Serialization
 serde.workspace = true

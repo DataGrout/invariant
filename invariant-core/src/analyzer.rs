@@ -58,6 +58,7 @@ impl Analyzer {
             }
             Language::Go => analyze_go(&root, ctx)?,
             Language::Elixir => analyze_elixir(&root, ctx)?,
+            Language::Ruby => analyze_ruby(&root, ctx)?,
         }
 
         summary.loc = code.lines().count();
@@ -737,6 +738,251 @@ fn analyze_elixir_calls(
 }
 
 // ========================================================================
+// Ruby Analysis
+// ========================================================================
+
+fn analyze_ruby(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let (module_id, module_name) = module_id_from_path(ctx.filepath, ".rb", "::");
+    emit_module(ctx, &module_id, &module_name, ctx.filepath, 1);
+    analyze_ruby_body(root, &module_id, ctx)
+}
+
+/// Iterates children sequentially, tracking Ruby visibility modifiers.
+///
+/// In Ruby, bare `private`/`protected`/`public` statements change the default
+/// visibility for all subsequent method definitions in that scope. The form
+/// `private :method_name` overrides visibility for a specific named method.
+fn analyze_ruby_body(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    let mut cursor = node.walk();
+    let mut current_visibility = "public";
+    let mut per_method_overrides: Vec<(String, String)> = Vec::new();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                let text = node_text(&child, ctx.code);
+                match text {
+                    "private" | "protected" | "public" => {
+                        current_visibility = match text {
+                            "private" => "private",
+                            "protected" => "protected",
+                            _ => "public",
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            "method" => {
+                let method_name = child
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, ctx.code).to_string());
+
+                let visibility = method_name
+                    .as_deref()
+                    .and_then(|name| {
+                        per_method_overrides
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .map(|(_, v)| v.as_str())
+                    })
+                    .unwrap_or(current_visibility);
+
+                analyze_ruby_method(&child, module_id, visibility, ctx)?;
+            }
+            "singleton_method" => {
+                analyze_ruby_method(&child, module_id, "public", ctx)?;
+            }
+            "class" => {
+                analyze_ruby_class(&child, ctx)?;
+            }
+            "module" => {
+                analyze_ruby_module(&child, ctx)?;
+            }
+            "call" => {
+                let call_name = child
+                    .child(0)
+                    .map(|n| node_text(&n, ctx.code).to_string())
+                    .unwrap_or_default();
+
+                match call_name.as_str() {
+                    "private" | "protected" | "public" => {
+                        if let Some(args) = find_child_by_kind(&child, "argument_list") {
+                            // `private :method_name` — per-method override
+                            let mut args_cursor = args.walk();
+                            for arg in args.named_children(&mut args_cursor) {
+                                let sym_text = node_text(&arg, ctx.code);
+                                let method_name = sym_text.trim_start_matches(':');
+                                per_method_overrides
+                                    .push((method_name.to_string(), call_name.clone()));
+                            }
+                        } else {
+                            // Bare `private` as a call node (shouldn't happen
+                            // based on what we see, but handle defensively)
+                            current_visibility = match call_name.as_str() {
+                                "private" => "private",
+                                "protected" => "protected",
+                                _ => "public",
+                            };
+                        }
+                    }
+                    "require" | "require_relative" => {
+                        analyze_ruby_require(&child, module_id, ctx)?;
+                    }
+                    "include" | "extend" | "prepend" => {
+                        analyze_ruby_include(&child, module_id, ctx)?;
+                    }
+                    _ => {
+                        analyze_ruby_body(&child, module_id, ctx)?;
+                    }
+                }
+            }
+            _ => {
+                analyze_ruby_body(&child, module_id, ctx)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn analyze_ruby_class(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let class_name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(&n, ctx.code).to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let class_id = normalize_id(&class_name);
+    emit_module(
+        ctx,
+        &class_id,
+        &class_name,
+        &format!("class:{}", class_name),
+        node_line(node),
+    );
+
+    if let Some(body) = node.child_by_field_name("body") {
+        analyze_ruby_body(&body, &class_id, ctx)?;
+    }
+
+    Ok(())
+}
+
+fn analyze_ruby_module(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let module_name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(&n, ctx.code).to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let module_id = normalize_id(&module_name);
+    emit_module(
+        ctx,
+        &module_id,
+        &module_name,
+        &format!("module:{}", module_name),
+        node_line(node),
+    );
+
+    if let Some(body) = node.child_by_field_name("body") {
+        analyze_ruby_body(&body, &module_id, ctx)?;
+    }
+
+    Ok(())
+}
+
+fn analyze_ruby_method(
+    node: &Node<'_>,
+    module_id: &str,
+    visibility: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(&n, ctx.code).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let arity = node
+        .child_by_field_name("parameters")
+        .map(|n| n.named_child_count())
+        .unwrap_or(0);
+
+    let func_id = normalize_id(&format!("{}_{}", name, arity));
+    let line = node_line(node);
+
+    emit_function(ctx, &func_id, module_id, &name, arity, visibility, line);
+
+    if let Some(body) = node.child_by_field_name("body") {
+        analyze_ruby_calls(&body, ctx.code, &func_id, ctx)?;
+    }
+
+    Ok(())
+}
+
+fn analyze_ruby_require(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    let text = node_text(node, ctx.code);
+
+    if let Some(start) = text.find(['"', '\'']) {
+        let remaining = &text[start + 1..];
+        if let Some(end) = remaining.find(['"', '\'']) {
+            let required = &remaining[..end];
+            let kind = if text.starts_with("require_relative") {
+                "require_relative"
+            } else {
+                "require"
+            };
+            emit_dependency(ctx, module_id, required, kind, node_line(node));
+        }
+    }
+
+    Ok(())
+}
+
+fn analyze_ruby_include(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    let text = node_text(node, ctx.code);
+    let parts: Vec<&str> = text.split_whitespace().collect();
+
+    if parts.len() >= 2 {
+        let kind = parts[0];
+        let included = parts[1];
+        emit_dependency(ctx, module_id, included, kind, node_line(node));
+    }
+
+    Ok(())
+}
+
+fn analyze_ruby_calls(
+    node: &Node<'_>,
+    code: &[u8],
+    func_id: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        if child.kind() == "call" {
+            if let Some(method) = child.child_by_field_name("method") {
+                let called = node_text(&method, code);
+                if !matches!(
+                    called,
+                    "require"
+                        | "require_relative"
+                        | "include"
+                        | "extend"
+                        | "prepend"
+                        | "attr_reader"
+                        | "attr_writer"
+                        | "attr_accessor"
+                ) {
+                    emit_call(ctx, func_id, called, node_line(&child));
+                }
+            }
+        }
+        analyze_ruby_calls(&child, code, func_id, ctx)?;
+    }
+
+    Ok(())
+}
+
+// ========================================================================
 // Shared call analysis (Python uses "call", Rust/JS/Go use "call_expression")
 // ========================================================================
 
@@ -840,5 +1086,147 @@ end
         assert!(has_public, "add should be public");
         assert!(has_private, "validate should be private");
         assert!(has_import, "Missing import dependency");
+    }
+
+    #[test]
+    fn test_analyze_ruby_simple() {
+        let mut analyzer = Analyzer::new().unwrap();
+
+        let code = r#"
+require "json"
+
+class Calculator
+  include Comparable
+
+  def add(a, b)
+    a + b
+  end
+
+  def self.version
+    "1.0"
+  end
+
+  private
+
+  def validate(x)
+    x > 0
+  end
+end
+"#;
+
+        let result = analyzer
+            .lens_code(code, Language::Ruby, "calculator.rb", "abc123")
+            .unwrap();
+
+        assert!(
+            result.summary.functions >= 2,
+            "Expected at least 2 functions, got {}",
+            result.summary.functions
+        );
+
+        let has_add = result.facts.iter().any(|f| f.contains("'add'"));
+        let has_class = result.facts.iter().any(|f| f.contains("Calculator"));
+        let has_require = result
+            .facts
+            .iter()
+            .any(|f| f.contains("depends_on") && f.contains("json"));
+
+        assert!(has_add, "Missing add method fact");
+        assert!(has_class, "Missing Calculator class fact");
+        assert!(has_require, "Missing require dependency");
+    }
+
+    #[test]
+    fn test_analyze_ruby_visibility() {
+        let mut analyzer = Analyzer::new().unwrap();
+
+        let code = r#"
+class Account
+  def public_method
+    nil
+  end
+
+  private
+
+  def secret_method
+    nil
+  end
+
+  def another_secret
+    nil
+  end
+
+  protected
+
+  def family_method
+    nil
+  end
+
+  public
+
+  def back_to_public
+    nil
+  end
+
+  private :targeted_method
+
+  def targeted_method
+    nil
+  end
+end
+"#;
+
+        let result = analyzer
+            .lens_code(code, Language::Ruby, "account.rb", "abc123")
+            .unwrap();
+
+        let vis_for = |name: &str| -> Option<String> {
+            result
+                .facts
+                .iter()
+                .find(|f| f.starts_with("function_visibility(") && f.contains(name))
+                .and_then(|f| {
+                    if f.contains("public") {
+                        Some("public".to_string())
+                    } else if f.contains("private") {
+                        Some("private".to_string())
+                    } else if f.contains("protected") {
+                        Some("protected".to_string())
+                    } else {
+                        None
+                    }
+                })
+        };
+
+        assert_eq!(
+            vis_for("public_method").as_deref(),
+            Some("public"),
+            "public_method should be public"
+        );
+        assert_eq!(
+            vis_for("secret_method").as_deref(),
+            Some("private"),
+            "secret_method should be private"
+        );
+        assert_eq!(
+            vis_for("another_secret").as_deref(),
+            Some("private"),
+            "another_secret should be private (inherits from bare private)"
+        );
+        assert_eq!(
+            vis_for("family_method").as_deref(),
+            Some("protected"),
+            "family_method should be protected"
+        );
+        assert_eq!(
+            vis_for("back_to_public").as_deref(),
+            Some("public"),
+            "back_to_public should be public (visibility reset)"
+        );
+        assert_eq!(
+            vis_for("targeted_method").as_deref(),
+            Some("private"),
+            "targeted_method should be private (via private :method_name)"
+        );
     }
 }

@@ -92,7 +92,7 @@ pub struct ToolCall {
     pub duration_ms: u64,
 }
 
-/// Query result returned from server-side Prism queries
+/// Query result returned from server-side Invariant queries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     /// Query that was executed

@@ -25,10 +25,10 @@ cargo build --release
 # Initialize (bootstraps mTLS identity automatically)
 invariant init --url https://gateway.datagrout.ai/servers/{uuid}/mcp --token <your-token>
 
-# Analyze your codebase (extracts structural facts + uploads to Prism)
+# Analyze your codebase (extracts structural facts + uploads to Invariant)
 invariant lens
 
-# Query for issues (via DataGrout Prism)
+# Query for issues (via DataGrout Invariant)
 invariant query orphans
 invariant query test_gaps
 invariant query intent_mismatches
@@ -51,7 +51,7 @@ After the first `invariant init`, no token or API key is needed again — the mT
                │ Conduit SDK (mTLS)
                ↓
 ┌───────────────────────────────────────┐
-│  DataGrout Prism (server)             │
+│  DataGrout Invariant (server)         │
 │                                       │
 │  semantic enrichment (LLM)            │
 │  consequence queries                  │
@@ -60,7 +60,7 @@ After the first `invariant init`, no token or API key is needed again — the mT
 └───────────────────────────────────────┘
 ```
 
-Invariant performs fast, local structural extraction using tree-sitter. It understands Python, Rust, TypeScript, TSX, JavaScript, Go, and Elixir ASTs natively. Facts are uploaded to DataGrout Prism via the Conduit SDK for server-side semantic enrichment — LLM-powered intent classification, security analysis, and consequence reasoning.
+Invariant performs fast, local structural extraction using tree-sitter. It understands Python, Rust, TypeScript, TSX, JavaScript, Go, Elixir, and Ruby ASTs natively. Facts are uploaded to DataGrout Invariant via the Conduit SDK for server-side semantic enrichment — LLM-powered intent classification, security analysis, and consequence reasoning.
 
 ## Installation
 
@@ -97,7 +97,7 @@ invariant -v lens                 # Verbose output (debug logging)
 
 ### `invariant query <query>`
 
-Run semantic queries via DataGrout Prism.
+Run semantic queries via DataGrout Invariant.
 
 ```bash
 invariant query orphans              # Functions never called
@@ -132,6 +132,7 @@ Show connection, identity, and configuration status.
 | JavaScript | tree-sitter| `.js`, `.jsx`    |
 | Go         | tree-sitter| `.go`            |
 | Elixir     | tree-sitter| `.ex`, `.exs`    |
+| Ruby       | tree-sitter| `.rb`, `.rake`, `.gemspec` |
 
 ## Architecture
 

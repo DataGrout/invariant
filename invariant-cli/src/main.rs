@@ -47,7 +47,7 @@ enum Commands {
         local_only: bool,
     },
 
-    /// Execute queries over analyzed facts via DataGrout Prism
+    /// Execute queries over analyzed facts via DataGrout Invariant
     Query {
         /// Query name (e.g. "orphans", "test_gaps", "intent_mismatches")
         query: String,
@@ -429,7 +429,7 @@ async fn cmd_lens(
     println!("  Facts:     {}", total_facts);
 
     if uploaded > 0 {
-        println!("  {} {} files uploaded to Prism", "↑".cyan(), uploaded);
+        println!("  {} {} files uploaded to Invariant", "↑".cyan(), uploaded);
     } else if bridge.is_none() && !local_only {
         println!(
             "  {} Run `invariant init` to enable remote analysis",

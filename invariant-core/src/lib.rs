@@ -2,14 +2,14 @@
 //!
 //! Fast, multi-language structural code analysis using tree-sitter for parsing.
 //! Extracts Prolog-compatible facts from source code and uploads them to
-//! DataGrout Prism for server-side semantic enrichment and querying.
+//! DataGrout Invariant for server-side semantic enrichment and querying.
 //!
 //! # Architecture
 //!
 //! - **Parser**: Tree-sitter based multi-language AST extraction
 //! - **Analyzer**: Extracts structural facts (functions, modules, imports, calls)
 //! - **Facts**: Prolog-compatible fact generation and formatting
-//! - **Bridge**: Conduit SDK client for DataGrout Prism integration
+//! - **Bridge**: Conduit SDK client for DataGrout Invariant integration
 //!
 //! # Example
 //!
