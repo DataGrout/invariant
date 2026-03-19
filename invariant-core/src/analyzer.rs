@@ -1,7 +1,7 @@
 //! Code analyzer that extracts semantic facts from ASTs
 
-use crate::facts::{Fact, FactValue, normalize_id};
-use crate::parser::{Language, Parser, node_line, node_text};
+use crate::facts::{normalize_id, Fact, FactValue};
+use crate::parser::{node_line, node_text, Language, Parser};
 use crate::types::{AnalysisResult, AnalysisSummary, Error, Result};
 use sha2::{Digest, Sha256};
 use tree_sitter::Node;
@@ -53,7 +53,9 @@ impl Analyzer {
         match language {
             Language::Python => analyze_python(&root, ctx)?,
             Language::Rust => analyze_rust(&root, ctx)?,
-            Language::TypeScript | Language::Tsx | Language::JavaScript => analyze_javascript(&root, ctx)?,
+            Language::TypeScript | Language::Tsx | Language::JavaScript => {
+                analyze_javascript(&root, ctx)?
+            }
             Language::Go => analyze_go(&root, ctx)?,
             Language::Elixir => analyze_elixir(&root, ctx)?,
         }
@@ -81,59 +83,85 @@ impl Analyzer {
 // Helpers
 // ========================================================================
 
-fn emit_function(ctx: &mut Ctx<'_>, func_id: &str, module_id: &str, name: &str, arity: usize, visibility: &str, line: usize) {
-    ctx.facts.push(Fact::new("function", vec![
-        FactValue::String(func_id.to_string()),
-        FactValue::String(module_id.to_string()),
-        FactValue::String(name.to_string()),
-        FactValue::Integer(arity as i64),
-        FactValue::Atom(visibility.to_string()),
-        FactValue::Integer(line as i64),
-        FactValue::String(ctx.commit_sha.to_string()),
-    ]));
+fn emit_function(
+    ctx: &mut Ctx<'_>,
+    func_id: &str,
+    module_id: &str,
+    name: &str,
+    arity: usize,
+    visibility: &str,
+    line: usize,
+) {
+    ctx.facts.push(Fact::new(
+        "function",
+        vec![
+            FactValue::String(func_id.to_string()),
+            FactValue::String(module_id.to_string()),
+            FactValue::String(name.to_string()),
+            FactValue::Integer(arity as i64),
+            FactValue::Atom(visibility.to_string()),
+            FactValue::Integer(line as i64),
+            FactValue::String(ctx.commit_sha.to_string()),
+        ],
+    ));
 
-    ctx.facts.push(Fact::new("function_line", vec![
-        FactValue::String(func_id.to_string()),
-        FactValue::Integer(line as i64),
-    ]));
+    ctx.facts.push(Fact::new(
+        "function_line",
+        vec![
+            FactValue::String(func_id.to_string()),
+            FactValue::Integer(line as i64),
+        ],
+    ));
 
-    ctx.facts.push(Fact::new("function_visibility", vec![
-        FactValue::String(func_id.to_string()),
-        FactValue::Atom(visibility.to_string()),
-    ]));
+    ctx.facts.push(Fact::new(
+        "function_visibility",
+        vec![
+            FactValue::String(func_id.to_string()),
+            FactValue::Atom(visibility.to_string()),
+        ],
+    ));
 
     ctx.summary.functions += 1;
 }
 
 fn emit_module(ctx: &mut Ctx<'_>, module_id: &str, module_name: &str, filepath: &str, line: usize) {
-    ctx.facts.push(Fact::new("module", vec![
-        FactValue::String(module_id.to_string()),
-        FactValue::String(module_name.to_string()),
-        FactValue::String(filepath.to_string()),
-        FactValue::Integer(line as i64),
-        FactValue::String(ctx.commit_sha.to_string()),
-    ]));
+    ctx.facts.push(Fact::new(
+        "module",
+        vec![
+            FactValue::String(module_id.to_string()),
+            FactValue::String(module_name.to_string()),
+            FactValue::String(filepath.to_string()),
+            FactValue::Integer(line as i64),
+            FactValue::String(ctx.commit_sha.to_string()),
+        ],
+    ));
     ctx.summary.modules += 1;
 }
 
 fn emit_dependency(ctx: &mut Ctx<'_>, module_id: &str, dep_name: &str, kind: &str, line: usize) {
-    ctx.facts.push(Fact::new("depends_on", vec![
-        FactValue::String(module_id.to_string()),
-        FactValue::String(dep_name.to_string()),
-        FactValue::Atom(kind.to_string()),
-        FactValue::Integer(line as i64),
-    ]));
+    ctx.facts.push(Fact::new(
+        "depends_on",
+        vec![
+            FactValue::String(module_id.to_string()),
+            FactValue::String(dep_name.to_string()),
+            FactValue::Atom(kind.to_string()),
+            FactValue::Integer(line as i64),
+        ],
+    ));
     ctx.summary.dependencies += 1;
 }
 
 fn emit_call(ctx: &mut Ctx<'_>, caller_id: &str, called_func: &str, line: usize) {
-    ctx.facts.push(Fact::new("calls_external", vec![
-        FactValue::String(caller_id.to_string()),
-        FactValue::String("unknown".to_string()),
-        FactValue::String(called_func.to_string()),
-        FactValue::Integer(0),
-        FactValue::Integer(line as i64),
-    ]));
+    ctx.facts.push(Fact::new(
+        "calls_external",
+        vec![
+            FactValue::String(caller_id.to_string()),
+            FactValue::String("unknown".to_string()),
+            FactValue::String(called_func.to_string()),
+            FactValue::Integer(0),
+            FactValue::Integer(line as i64),
+        ],
+    ));
     ctx.summary.calls += 1;
 }
 
@@ -150,9 +178,7 @@ fn param_count(node: &Node<'_>, field: &str) -> usize {
 }
 
 fn module_id_from_path(filepath: &str, ext: &str, sep: &str) -> (String, String) {
-    let module_name = filepath
-        .trim_end_matches(ext)
-        .replace(['/', '\\'], sep);
+    let module_name = filepath.trim_end_matches(ext).replace(['/', '\\'], sep);
     let module_id = normalize_id(&module_name);
     (module_id, module_name)
 }
@@ -191,7 +217,8 @@ fn analyze_python_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
 }
 
 fn analyze_python_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
-    let name_node = node.child_by_field_name("name")
+    let name_node = node
+        .child_by_field_name("name")
         .ok_or_else(|| Error::Parse("Function has no name".to_string()))?;
     let func_name = node_text(&name_node, ctx.code);
     let arity = param_count(node, "parameters");
@@ -218,12 +245,19 @@ fn analyze_python_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) 
 }
 
 fn analyze_python_class(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
-    let name_node = node.child_by_field_name("name")
+    let name_node = node
+        .child_by_field_name("name")
         .ok_or_else(|| Error::Parse("Class has no name".to_string()))?;
     let class_name = node_text(&name_node, ctx.code);
     let class_id = normalize_id(class_name);
 
-    emit_module(ctx, &class_id, class_name, &format!("class:{}", class_name), node_line(node));
+    emit_module(
+        ctx,
+        &class_id,
+        class_name,
+        &format!("class:{}", class_name),
+        node_line(node),
+    );
 
     if let Some(body) = node.child_by_field_name("body") {
         analyze_python_node(&body, &class_id, ctx)?;
@@ -282,14 +316,19 @@ fn analyze_rust(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
 }
 
 fn analyze_rust_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
-    let name_node = node.child_by_field_name("name")
+    let name_node = node
+        .child_by_field_name("name")
         .ok_or_else(|| Error::Parse("Function has no name".to_string()))?;
     let func_name = node_text(&name_node, ctx.code);
     let arity = param_count(node, "parameters");
     let func_id = normalize_id(&format!("{}_{}", func_name, arity));
     let line = node_line(node);
 
-    let visibility = if has_pub_modifier(node, ctx.code) { "public" } else { "private" };
+    let visibility = if has_pub_modifier(node, ctx.code) {
+        "public"
+    } else {
+        "private"
+    };
 
     emit_function(ctx, &func_id, module_id, func_name, arity, visibility, line);
 
@@ -304,7 +343,13 @@ fn analyze_rust_type(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Res
     if let Some(name_node) = node.child_by_field_name("name") {
         let type_name = node_text(&name_node, ctx.code);
         let type_id = normalize_id(type_name);
-        emit_module(ctx, &type_id, type_name, &format!("type:{}", module_id), node_line(node));
+        emit_module(
+            ctx,
+            &type_id,
+            type_name,
+            &format!("type:{}", module_id),
+            node_line(node),
+        );
     }
 
     Ok(())
@@ -325,7 +370,10 @@ fn analyze_rust_impl(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Res
 fn analyze_rust_use(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
     let text = node_text(node, ctx.code);
 
-    if let Some(used_module) = text.strip_prefix("use ").and_then(|s| s.split_whitespace().next()) {
+    if let Some(used_module) = text
+        .strip_prefix("use ")
+        .and_then(|s| s.split_whitespace().next())
+    {
         let used_module = used_module.trim_end_matches(';').replace("::", ".");
         emit_dependency(ctx, module_id, &used_module, "use", node_line(node));
     }
@@ -357,7 +405,8 @@ fn has_pub_modifier(node: &Node<'_>, code: &[u8]) -> bool {
 // ========================================================================
 
 fn analyze_javascript(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
-    let module_name = ctx.filepath
+    let module_name = ctx
+        .filepath
         .trim_end_matches(".js")
         .trim_end_matches(".ts")
         .trim_end_matches(".jsx")
@@ -393,7 +442,8 @@ fn analyze_js_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Resul
 }
 
 fn analyze_js_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
-    let name = node.child_by_field_name("name")
+    let name = node
+        .child_by_field_name("name")
         .map(|n| node_text(&n, ctx.code).to_string())
         .unwrap_or_else(|| "anonymous".to_string());
 
@@ -415,7 +465,13 @@ fn analyze_js_class(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
         let class_name = node_text(&name_node, ctx.code);
         let class_id = normalize_id(class_name);
 
-        emit_module(ctx, &class_id, class_name, &format!("class:{}", class_name), node_line(node));
+        emit_module(
+            ctx,
+            &class_id,
+            class_name,
+            &format!("class:{}", class_name),
+            node_line(node),
+        );
 
         if let Some(body) = node.child_by_field_name("body") {
             analyze_js_node(&body, &class_id, ctx)?;
@@ -478,7 +534,11 @@ fn analyze_go_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
     let func_id = normalize_id(&format!("{}_{}", name, arity));
     let line = node_line(node);
 
-    let visibility = if name.starts_with(|c: char| c.is_uppercase()) { "public" } else { "private" };
+    let visibility = if name.starts_with(|c: char| c.is_uppercase()) {
+        "public"
+    } else {
+        "private"
+    };
 
     emit_function(ctx, &func_id, module_id, &name, arity, visibility, line);
 
@@ -534,8 +594,12 @@ fn analyze_elixir_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
                     let target_text = node_text(&target, ctx.code);
                     match target_text {
                         "defmodule" => analyze_elixir_defmodule(&child, ctx)?,
-                        "def" | "defp" => analyze_elixir_function(&child, module_id, target_text, ctx)?,
-                        "import" | "use" | "alias" => analyze_elixir_dep(&child, module_id, target_text, ctx)?,
+                        "def" | "defp" => {
+                            analyze_elixir_function(&child, module_id, target_text, ctx)?
+                        }
+                        "import" | "use" | "alias" => {
+                            analyze_elixir_dep(&child, module_id, target_text, ctx)?
+                        }
                         _ => analyze_elixir_node(&child, module_id, ctx)?,
                     }
                 } else {
@@ -563,7 +627,13 @@ fn analyze_elixir_defmodule(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
         .unwrap_or_else(|| "Unknown".to_string());
 
     let module_id = normalize_id(&module_name);
-    emit_module(ctx, &module_id, &module_name, &format!("defmodule:{}", module_name), node_line(node));
+    emit_module(
+        ctx,
+        &module_id,
+        &module_name,
+        &format!("defmodule:{}", module_name),
+        node_line(node),
+    );
 
     if let Some(do_block) = find_child_by_kind(node, "do_block") {
         analyze_elixir_node(&do_block, &module_id, ctx)?;
@@ -572,7 +642,12 @@ fn analyze_elixir_defmodule(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
-fn analyze_elixir_function(node: &Node<'_>, module_id: &str, kind: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+fn analyze_elixir_function(
+    node: &Node<'_>,
+    module_id: &str,
+    kind: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
     // `def add(a, b) do...end` is a call node:
     //   target: identifier("def")         [field]
     //   arguments: (call("add", "(a,b)")) [no field, find by kind]
@@ -589,7 +664,8 @@ fn analyze_elixir_function(node: &Node<'_>, module_id: &str, kind: &str, ctx: &m
     };
 
     let (func_name, arity) = if head.kind() == "call" {
-        let name = head.child_by_field_name("target")
+        let name = head
+            .child_by_field_name("target")
             .map(|n| node_text(&n, ctx.code).to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let params = find_child_by_kind(&head, "arguments")
@@ -604,7 +680,9 @@ fn analyze_elixir_function(node: &Node<'_>, module_id: &str, kind: &str, ctx: &m
     let line = node_line(node);
     let visibility = if kind == "defp" { "private" } else { "public" };
 
-    emit_function(ctx, &func_id, module_id, &func_name, arity, visibility, line);
+    emit_function(
+        ctx, &func_id, module_id, &func_name, arity, visibility, line,
+    );
 
     if let Some(do_block) = find_child_by_kind(node, "do_block") {
         analyze_elixir_calls(&do_block, ctx.code, &func_id, ctx)?;
@@ -613,7 +691,12 @@ fn analyze_elixir_function(node: &Node<'_>, module_id: &str, kind: &str, ctx: &m
     Ok(())
 }
 
-fn analyze_elixir_dep(node: &Node<'_>, module_id: &str, kind: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+fn analyze_elixir_dep(
+    node: &Node<'_>,
+    module_id: &str,
+    kind: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
     let args = match find_child_by_kind(node, "arguments") {
         Some(a) => a,
         None => return Ok(()),
@@ -627,14 +710,22 @@ fn analyze_elixir_dep(node: &Node<'_>, module_id: &str, kind: &str, ctx: &mut Ct
     Ok(())
 }
 
-fn analyze_elixir_calls(node: &Node<'_>, code: &[u8], func_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+fn analyze_elixir_calls(
+    node: &Node<'_>,
+    code: &[u8],
+    func_id: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
     let mut cursor = node.walk();
 
     for child in node.children(&mut cursor) {
         if child.kind() == "call" {
             if let Some(target) = child.child_by_field_name("target") {
                 let called = node_text(&target, code);
-                if !matches!(called, "def" | "defp" | "defmodule" | "import" | "use" | "alias" | "do" | "end") {
+                if !matches!(
+                    called,
+                    "def" | "defp" | "defmodule" | "import" | "use" | "alias" | "do" | "end"
+                ) {
                     emit_call(ctx, func_id, called, node_line(&child));
                 }
             }
@@ -649,7 +740,13 @@ fn analyze_elixir_calls(node: &Node<'_>, code: &[u8], func_id: &str, ctx: &mut C
 // Shared call analysis (Python uses "call", Rust/JS/Go use "call_expression")
 // ========================================================================
 
-fn analyze_calls(node: &Node<'_>, code: &[u8], func_id: &str, ctx: &mut Ctx<'_>, call_kind: &str) -> Result<()> {
+fn analyze_calls(
+    node: &Node<'_>,
+    code: &[u8],
+    func_id: &str,
+    ctx: &mut Ctx<'_>,
+    call_kind: &str,
+) -> Result<()> {
     let mut cursor = node.walk();
 
     for child in node.children(&mut cursor) {
@@ -681,7 +778,9 @@ def world(x, y):
     return x + y
 "#;
 
-        let result = analyzer.lens_code(code, Language::Python, "test.py", "abc123").unwrap();
+        let result = analyzer
+            .lens_code(code, Language::Python, "test.py", "abc123")
+            .unwrap();
 
         assert!(result.summary.functions >= 2);
         assert!(!result.facts.is_empty());
@@ -711,15 +810,30 @@ defmodule MyApp.Calculator do
 end
 "#;
 
-        let result = analyzer.lens_code(code, Language::Elixir, "calculator.ex", "abc123").unwrap();
+        let result = analyzer
+            .lens_code(code, Language::Elixir, "calculator.ex", "abc123")
+            .unwrap();
 
-        assert!(result.summary.functions >= 2, "Expected at least 2 functions, got {}", result.summary.functions);
+        assert!(
+            result.summary.functions >= 2,
+            "Expected at least 2 functions, got {}",
+            result.summary.functions
+        );
 
         let has_add = result.facts.iter().any(|f| f.contains("'add'"));
         let has_validate = result.facts.iter().any(|f| f.contains("'validate'"));
-        let has_public = result.facts.iter().any(|f| f.contains("public") && f.contains("'add'"));
-        let has_private = result.facts.iter().any(|f| f.contains("private") && f.contains("'validate'"));
-        let has_import = result.facts.iter().any(|f| f.contains("depends_on") && f.contains("Enum"));
+        let has_public = result
+            .facts
+            .iter()
+            .any(|f| f.contains("public") && f.contains("'add'"));
+        let has_private = result
+            .facts
+            .iter()
+            .any(|f| f.contains("private") && f.contains("'validate'"));
+        let has_import = result
+            .facts
+            .iter()
+            .any(|f| f.contains("depends_on") && f.contains("Enum"));
 
         assert!(has_add, "Missing add function fact");
         assert!(has_validate, "Missing validate function fact");

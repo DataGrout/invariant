@@ -45,24 +45,49 @@ def unused_helper():
         .lens_code(code, Language::Python, "src/calculator.py", "abc123")
         .unwrap();
 
-    assert!(result.summary.modules >= 2, "file module + Calculator class");
+    assert!(
+        result.summary.modules >= 2,
+        "file module + Calculator class"
+    );
     assert!(result.summary.functions >= 7, "6 methods + 2 functions");
     assert!(result.summary.loc > 0);
 
     let modules = facts_by_predicate(&result.facts, "module(");
-    assert!(modules.len() >= 2, "expected file + class modules, got {}", modules.len());
+    assert!(
+        modules.len() >= 2,
+        "expected file + class modules, got {}",
+        modules.len()
+    );
 
     let functions = facts_by_predicate(&result.facts, "function(");
-    assert!(functions.len() >= 7, "expected 7+ function facts, got {}", functions.len());
+    assert!(
+        functions.len() >= 7,
+        "expected 7+ function facts, got {}",
+        functions.len()
+    );
 
-    let record_fact = result.facts.iter().find(|f| f.contains("'_record'")).unwrap();
-    assert!(record_fact.contains("protected"), "_record should be protected");
+    let record_fact = result
+        .facts
+        .iter()
+        .find(|f| f.contains("'_record'"))
+        .unwrap();
+    assert!(
+        record_fact.contains("protected"),
+        "_record should be protected"
+    );
 
     let add_fact = result.facts.iter().find(|f| f.contains("'add'")).unwrap();
     assert!(add_fact.contains("public"), "add should be public");
 
-    let repr_fact = result.facts.iter().find(|f| f.contains("'__repr__'")).unwrap();
-    assert!(repr_fact.contains("public"), "__repr__ (dunder) should be public");
+    let repr_fact = result
+        .facts
+        .iter()
+        .find(|f| f.contains("'__repr__'"))
+        .unwrap();
+    assert!(
+        repr_fact.contains("public"),
+        "__repr__ (dunder) should be public"
+    );
 
     let deps = facts_by_predicate(&result.facts, "depends_on(");
     assert!(deps.len() >= 2, "math + decimal imports expected");
@@ -74,7 +99,11 @@ def unused_helper():
         assert!(fact.ends_with('.'), "malformed fact: {}", fact);
     }
 
-    let sha_facts = result.facts.iter().filter(|f| f.contains("'abc123'")).count();
+    let sha_facts = result
+        .facts
+        .iter()
+        .filter(|f| f.contains("'abc123'"))
+        .count();
     assert!(sha_facts > 0, "commit SHA should appear in facts");
 }
 
@@ -111,13 +140,30 @@ pub fn handle(key: &str) -> String {
         .lens_code(code, Language::Rust, "src/server.rs", "def456")
         .unwrap();
 
-    assert!(result.summary.functions >= 4, "new, get, validate_key, handle");
+    assert!(
+        result.summary.functions >= 4,
+        "new, get, validate_key, handle"
+    );
 
-    let validate_fact = result.facts.iter().find(|f| f.contains("'validate_key'")).unwrap();
-    assert!(validate_fact.contains("private"), "validate_key should be private");
+    let validate_fact = result
+        .facts
+        .iter()
+        .find(|f| f.contains("'validate_key'"))
+        .unwrap();
+    assert!(
+        validate_fact.contains("private"),
+        "validate_key should be private"
+    );
 
-    let handle_fact = result.facts.iter().find(|f| f.contains("'handle'")).unwrap();
-    assert!(handle_fact.contains("public"), "pub fn handle should be public");
+    let handle_fact = result
+        .facts
+        .iter()
+        .find(|f| f.contains("'handle'"))
+        .unwrap();
+    assert!(
+        handle_fact.contains("public"),
+        "pub fn handle should be public"
+    );
 
     let deps = facts_by_predicate(&result.facts, "depends_on(");
     assert!(deps.len() >= 2, "HashMap + Arc use decls expected");
@@ -186,11 +232,25 @@ func unusedUtility(x int) int {
 
     assert!(result.summary.functions >= 3);
 
-    let new_fact = result.facts.iter().find(|f| f.contains("'NewHandler'")).unwrap();
-    assert!(new_fact.contains("public"), "NewHandler should be public (uppercase)");
+    let new_fact = result
+        .facts
+        .iter()
+        .find(|f| f.contains("'NewHandler'"))
+        .unwrap();
+    assert!(
+        new_fact.contains("public"),
+        "NewHandler should be public (uppercase)"
+    );
 
-    let unused_fact = result.facts.iter().find(|f| f.contains("'unusedUtility'")).unwrap();
-    assert!(unused_fact.contains("private"), "unusedUtility should be private (lowercase)");
+    let unused_fact = result
+        .facts
+        .iter()
+        .find(|f| f.contains("'unusedUtility'"))
+        .unwrap();
+    assert!(
+        unused_fact.contains("private"),
+        "unusedUtility should be private (lowercase)"
+    );
 
     assert!(result.summary.dependencies >= 3, "json, fmt, net/http");
 }
@@ -257,17 +317,30 @@ end
         .lens_code(code, Language::Elixir, "lib/my_app/users.ex", "elx_sha")
         .unwrap();
 
-    assert!(result.summary.functions >= 3, "list_users, get_user, changeset expected");
+    assert!(
+        result.summary.functions >= 3,
+        "list_users, get_user, changeset expected"
+    );
 
-    let changeset_fact = result.facts.iter()
+    let changeset_fact = result
+        .facts
+        .iter()
         .find(|f| f.contains("'changeset'") && f.starts_with("function("));
     assert!(changeset_fact.is_some(), "changeset should be extracted");
-    assert!(changeset_fact.unwrap().contains("private"), "defp changeset should be private");
+    assert!(
+        changeset_fact.unwrap().contains("private"),
+        "defp changeset should be private"
+    );
 
-    let list_fact = result.facts.iter()
+    let list_fact = result
+        .facts
+        .iter()
         .find(|f| f.contains("'list_users'") && f.starts_with("function("));
     assert!(list_fact.is_some(), "list_users should be extracted");
-    assert!(list_fact.unwrap().contains("public"), "def list_users should be public");
+    assert!(
+        list_fact.unwrap().contains("public"),
+        "def list_users should be public"
+    );
 
     let deps = facts_by_predicate(&result.facts, "depends_on(");
     assert!(deps.len() >= 2, "import + alias expected");

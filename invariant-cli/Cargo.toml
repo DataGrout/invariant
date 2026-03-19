@@ -1,9 +1,11 @@
 [package]
 name = "invariant-cli"
+description = "Semantic code analysis CLI for the AI era — powered by DataGrout"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "invariant"
@@ -11,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Core
-invariant-core = { path = "../invariant-core" }
+invariant-core = { path = "../invariant-core", version = "0.1.0" }
 
 # Async
 tokio.workspace = true

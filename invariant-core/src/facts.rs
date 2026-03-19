@@ -9,19 +9,19 @@ use serde::{Deserialize, Serialize};
 pub enum FactValue {
     /// String value (rendered as '...')
     String(String),
-    
+
     /// Atom value (rendered as atom)
     Atom(String),
-    
+
     /// Integer value
     Integer(i64),
-    
+
     /// Float value
     Float(f64),
-    
+
     /// List of values
     List(Vec<FactValue>),
-    
+
     /// Compound term
     Compound(String, Vec<FactValue>),
 }
@@ -31,7 +31,7 @@ pub enum FactValue {
 pub struct Fact {
     /// Predicate name
     pub predicate: String,
-    
+
     /// Arguments
     pub args: Vec<FactValue>,
 }
@@ -44,15 +44,16 @@ impl Fact {
             args,
         }
     }
-    
+
     /// Convert fact to Prolog string format
     pub fn to_prolog(&self) -> String {
-        let args_str = self.args
+        let args_str = self
+            .args
             .iter()
             .map(|arg| arg.to_prolog())
             .collect::<Vec<_>>()
             .join(", ");
-        
+
         format!("{}({}).", self.predicate, args_str)
     }
 }
@@ -110,47 +111,48 @@ pub fn normalize_id(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_fact_to_prolog() {
-        let fact = Fact::new("function", vec![
-            FactValue::String("my_func".to_string()),
-            FactValue::String("MyModule".to_string()),
-            FactValue::String("my_func".to_string()),
-            FactValue::Integer(2),
-            FactValue::Atom("public".to_string()),
-            FactValue::Integer(42),
-            FactValue::String("abc123".to_string()),
-        ]);
-        
+        let fact = Fact::new(
+            "function",
+            vec![
+                FactValue::String("my_func".to_string()),
+                FactValue::String("MyModule".to_string()),
+                FactValue::String("my_func".to_string()),
+                FactValue::Integer(2),
+                FactValue::Atom("public".to_string()),
+                FactValue::Integer(42),
+                FactValue::String("abc123".to_string()),
+            ],
+        );
+
         assert_eq!(
             fact.to_prolog(),
             "function('my_func', 'MyModule', 'my_func', 2, public, 42, 'abc123')."
         );
     }
-    
+
     #[test]
     fn test_list_fact() {
-        let fact = Fact::new("dependency_cycle", vec![
-            FactValue::List(vec![
+        let fact = Fact::new(
+            "dependency_cycle",
+            vec![FactValue::List(vec![
                 FactValue::String("A".to_string()),
                 FactValue::String("B".to_string()),
                 FactValue::String("C".to_string()),
-            ]),
-        ]);
-        
-        assert_eq!(
-            fact.to_prolog(),
-            "dependency_cycle(['A', 'B', 'C'])."
+            ])],
         );
+
+        assert_eq!(fact.to_prolog(), "dependency_cycle(['A', 'B', 'C']).");
     }
-    
+
     #[test]
     fn test_escape_prolog_string() {
         assert_eq!(escape_prolog_string("hello'world"), "hello\\'world");
         assert_eq!(escape_prolog_string("line1\nline2"), "line1\\nline2");
     }
-    
+
     #[test]
     fn test_normalize_id() {
         assert_eq!(normalize_id("MyFunction"), "myfunction");

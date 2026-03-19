@@ -52,8 +52,14 @@ def three(a, b, c):
         .lens_code(code, Language::Python, "test.py", "sha")
         .unwrap();
 
-    let has_zero = result.facts.iter().any(|f| f.contains("'zero'") && f.contains(", 0,"));
-    let has_three = result.facts.iter().any(|f| f.contains("'three'") && f.contains(", 3,"));
+    let has_zero = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'zero'") && f.contains(", 0,"));
+    let has_three = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'three'") && f.contains(", 3,"));
     assert!(has_zero, "missing zero/0 arity fact");
     assert!(has_three, "missing three/3 arity fact");
 }
@@ -78,19 +84,30 @@ def __dunder__(self):
         .lens_code(code, Language::Python, "vis.py", "sha")
         .unwrap();
 
-    let has_public =
-        result.facts.iter().any(|f| f.contains("'public_func'") && f.contains("public"));
-    let has_protected =
-        result.facts.iter().any(|f| f.contains("'_protected_func'") && f.contains("protected"));
-    let has_private =
-        result.facts.iter().any(|f| f.contains("'__private_func'") && f.contains("private"));
-    let has_dunder =
-        result.facts.iter().any(|f| f.contains("'__dunder__'") && f.contains("public"));
+    let has_public = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'public_func'") && f.contains("public"));
+    let has_protected = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'_protected_func'") && f.contains("protected"));
+    let has_private = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'__private_func'") && f.contains("private"));
+    let has_dunder = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'__dunder__'") && f.contains("public"));
 
     assert!(has_public, "public_func should be public");
     assert!(has_protected, "_protected_func should be protected");
     assert!(has_private, "__private_func should be private");
-    assert!(has_dunder, "__dunder__ is a magic method and should be public");
+    assert!(
+        has_dunder,
+        "__dunder__ is a magic method and should be public"
+    );
 }
 
 #[test]
@@ -108,10 +125,22 @@ class Greeter:
         .lens_code(code, Language::Python, "greet.py", "sha")
         .unwrap();
 
-    assert!(result.summary.modules >= 2, "should have at least 2 modules (file + class)");
-    assert!(has_fact(&result.facts, "'Greeter'"), "Greeter class should appear as module");
-    assert!(has_fact(&result.facts, "'greet'"), "greet method should be extracted");
-    assert!(has_fact(&result.facts, "'farewell'"), "farewell method should be extracted");
+    assert!(
+        result.summary.modules >= 2,
+        "should have at least 2 modules (file + class)"
+    );
+    assert!(
+        has_fact(&result.facts, "'Greeter'"),
+        "Greeter class should appear as module"
+    );
+    assert!(
+        has_fact(&result.facts, "'greet'"),
+        "greet method should be extracted"
+    );
+    assert!(
+        has_fact(&result.facts, "'farewell'"),
+        "farewell method should be extracted"
+    );
 }
 
 #[test]
@@ -129,7 +158,10 @@ from typing import Optional, List
 
     assert!(has_fact(&result.facts, "'os'"), "os import not found");
     assert!(has_fact(&result.facts, "'sys'"), "sys import not found");
-    assert!(has_fact(&result.facts, "'pathlib'"), "pathlib import_from not found");
+    assert!(
+        has_fact(&result.facts, "'pathlib'"),
+        "pathlib import_from not found"
+    );
 }
 
 #[test]
@@ -146,7 +178,10 @@ def process(data):
         .unwrap();
 
     assert!(result.summary.calls >= 2, "should detect at least 2 calls");
-    assert!(has_fact(&result.facts, "calls_external"), "calls_external facts expected");
+    assert!(
+        has_fact(&result.facts, "calls_external"),
+        "calls_external facts expected"
+    );
 }
 
 #[test]
@@ -157,8 +192,15 @@ fn test_python_module_fact_format() {
         .lens_code(code, Language::Python, "pkg/sub/mod.py", "sha1")
         .unwrap();
 
-    let module_fact = result.facts.iter().find(|f| f.starts_with("module(")).unwrap();
-    assert!(module_fact.contains("'sha1'"), "commit sha should be in module fact");
+    let module_fact = result
+        .facts
+        .iter()
+        .find(|f| f.starts_with("module("))
+        .unwrap();
+    assert!(
+        module_fact.contains("'sha1'"),
+        "commit sha should be in module fact"
+    );
     assert!(module_fact.contains("'pkg"), "module path not in fact");
 }
 
@@ -207,12 +249,18 @@ pub(crate) fn crate_fn() {}
         .lens_code(code, Language::Rust, "vis.rs", "sha")
         .unwrap();
 
-    let has_public =
-        result.facts.iter().any(|f| f.contains("'public_fn'") && f.contains("public"));
-    let has_private =
-        result.facts.iter().any(|f| f.contains("'private_fn'") && f.contains("private"));
-    let has_crate =
-        result.facts.iter().any(|f| f.contains("'crate_fn'") && f.contains("public"));
+    let has_public = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'public_fn'") && f.contains("public"));
+    let has_private = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'private_fn'") && f.contains("private"));
+    let has_crate = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'crate_fn'") && f.contains("public"));
 
     assert!(has_public, "public_fn should be public");
     assert!(has_private, "private_fn should be private");
@@ -245,9 +293,15 @@ impl Counter {
         .lens_code(code, Language::Rust, "counter.rs", "sha")
         .unwrap();
 
-    assert!(result.summary.functions >= 3, "new, increment, reset expected");
+    assert!(
+        result.summary.functions >= 3,
+        "new, increment, reset expected"
+    );
     assert!(has_fact(&result.facts, "'new'"), "new not found");
-    assert!(has_fact(&result.facts, "'increment'"), "increment not found");
+    assert!(
+        has_fact(&result.facts, "'increment'"),
+        "increment not found"
+    );
     assert!(has_fact(&result.facts, "'reset'"), "reset not found");
 }
 
@@ -264,7 +318,10 @@ use tokio::sync::RwLock;
         .unwrap();
 
     assert!(result.summary.dependencies >= 3, "expected 3 dependencies");
-    assert!(has_fact(&result.facts, "depends_on"), "depends_on facts expected");
+    assert!(
+        has_fact(&result.facts, "depends_on"),
+        "depends_on facts expected"
+    );
 }
 
 #[test]
@@ -281,7 +338,10 @@ pub trait Drawable { fn draw(&self); }
 
     assert!(has_fact(&result.facts, "'Point'"), "Point struct not found");
     assert!(has_fact(&result.facts, "'Color'"), "Color enum not found");
-    assert!(has_fact(&result.facts, "'Drawable'"), "Drawable trait not found");
+    assert!(
+        has_fact(&result.facts, "'Drawable'"),
+        "Drawable trait not found"
+    );
 }
 
 #[test]
@@ -347,7 +407,10 @@ class UserService {
         .lens_code(code, Language::TypeScript, "user_service.ts", "sha")
         .unwrap();
 
-    assert!(has_fact(&result.facts, "'UserService'"), "UserService class not found");
+    assert!(
+        has_fact(&result.facts, "'UserService'"),
+        "UserService class not found"
+    );
 }
 
 #[test]
@@ -380,7 +443,10 @@ function doSomething(x) {
         .unwrap();
 
     assert!(result.summary.functions >= 1);
-    assert!(has_fact(&result.facts, "'doSomething'"), "doSomething not found");
+    assert!(
+        has_fact(&result.facts, "'doSomething'"),
+        "doSomething not found"
+    );
 }
 
 #[test]
@@ -400,7 +466,10 @@ class Animal {
         .lens_code(code, Language::JavaScript, "animal.js", "sha")
         .unwrap();
 
-    assert!(has_fact(&result.facts, "'Animal'"), "Animal class not found");
+    assert!(
+        has_fact(&result.facts, "'Animal'"),
+        "Animal class not found"
+    );
 }
 
 // ─── Go ──────────────────────────────────────────────────────────────────────
@@ -425,7 +494,10 @@ func privateHelper(n int) int {
 
     assert!(result.summary.functions >= 2);
     assert!(has_fact(&result.facts, "'Hello'"), "Hello not found");
-    assert!(has_fact(&result.facts, "'privateHelper'"), "privateHelper not found");
+    assert!(
+        has_fact(&result.facts, "'privateHelper'"),
+        "privateHelper not found"
+    );
 }
 
 #[test]
@@ -441,10 +513,14 @@ func unexported() {}
         .lens_code(code, Language::Go, "vis.go", "sha")
         .unwrap();
 
-    let has_public =
-        result.facts.iter().any(|f| f.contains("'Exported'") && f.contains("public"));
-    let has_private =
-        result.facts.iter().any(|f| f.contains("'unexported'") && f.contains("private"));
+    let has_public = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'Exported'") && f.contains("public"));
+    let has_private = result
+        .facts
+        .iter()
+        .any(|f| f.contains("'unexported'") && f.contains("private"));
 
     assert!(has_public, "Exported should be public");
     assert!(has_private, "unexported should be private");
@@ -469,8 +545,10 @@ func main() {}
         .unwrap();
 
     assert!(result.summary.dependencies >= 3, "expected 3 imports");
-    assert!(has_fact(&result.facts, "\"fmt\"") || has_fact(&result.facts, "'fmt'"),
-        "fmt import not found");
+    assert!(
+        has_fact(&result.facts, "\"fmt\"") || has_fact(&result.facts, "'fmt'"),
+        "fmt import not found"
+    );
 }
 
 #[test]
@@ -567,7 +645,10 @@ fn test_empty_code_produces_module_fact() {
         .lens_code("", Language::Python, "empty.py", "sha")
         .unwrap();
 
-    assert!(!result.facts.is_empty(), "empty code should still produce module fact");
+    assert!(
+        !result.facts.is_empty(),
+        "empty code should still produce module fact"
+    );
     assert!(result.summary.functions == 0);
 }
 
@@ -585,7 +666,10 @@ def outer(x):
         .unwrap();
 
     assert!(result.summary.functions >= 1, "outer should be found");
-    assert!(has_fact(&result.facts, "'outer'"), "outer function fact expected");
+    assert!(
+        has_fact(&result.facts, "'outer'"),
+        "outer function fact expected"
+    );
 }
 
 // ─── Elixir ──────────────────────────────────────────────────────────────────
@@ -612,13 +696,25 @@ end
     assert!(has_fact(&result.facts, "'hello'"), "hello not found");
     assert!(has_fact(&result.facts, "'validate'"), "validate not found");
 
-    let hello_fact = result.facts.iter().find(|f| f.contains("'hello'") && f.starts_with("function("));
+    let hello_fact = result
+        .facts
+        .iter()
+        .find(|f| f.contains("'hello'") && f.starts_with("function("));
     assert!(hello_fact.is_some(), "hello function fact expected");
-    assert!(hello_fact.unwrap().contains("public"), "def hello should be public");
+    assert!(
+        hello_fact.unwrap().contains("public"),
+        "def hello should be public"
+    );
 
-    let validate_fact = result.facts.iter().find(|f| f.contains("'validate'") && f.starts_with("function("));
+    let validate_fact = result
+        .facts
+        .iter()
+        .find(|f| f.contains("'validate'") && f.starts_with("function("));
     assert!(validate_fact.is_some(), "validate function fact expected");
-    assert!(validate_fact.unwrap().contains("private"), "defp validate should be private");
+    assert!(
+        validate_fact.unwrap().contains("private"),
+        "defp validate should be private"
+    );
 }
 
 #[test]
@@ -639,9 +735,15 @@ end
         .lens_code(code, Language::Elixir, "lib/worker.ex", "sha")
         .unwrap();
 
-    assert!(has_fact(&result.facts, "depends_on"), "dependency facts expected");
+    assert!(
+        has_fact(&result.facts, "depends_on"),
+        "dependency facts expected"
+    );
     assert!(has_fact(&result.facts, "Enum"), "import Enum expected");
-    assert!(has_fact(&result.facts, "GenServer"), "use GenServer expected");
+    assert!(
+        has_fact(&result.facts, "GenServer"),
+        "use GenServer expected"
+    );
 }
 
 #[test]

@@ -1,9 +1,11 @@
 [package]
 name = "invariant-core"
+description = "Multi-language semantic code analysis library — tree-sitter fact extraction for DataGrout Prism"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 # Async

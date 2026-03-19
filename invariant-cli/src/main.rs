@@ -183,8 +183,7 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(log_level.into()),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(log_level.into()),
         )
         .init();
 
@@ -245,10 +244,7 @@ async fn cmd_init(
         println!("  {} {}", "Gateway:".green(), url);
 
         if Bridge::has_identity() {
-            println!(
-                "  {} mTLS identity found",
-                "✓".green()
-            );
+            println!("  {} mTLS identity found", "✓".green());
 
             match Bridge::connect(url).await {
                 Ok(_) => println!("  {} Connection verified", "✓".green()),
@@ -260,7 +256,10 @@ async fn cmd_init(
             let machine_name = format!("invariant-{}", repo_id);
             match Bridge::bootstrap(url, &token, &machine_name).await {
                 Ok(_) => {
-                    println!("  {} Identity created and saved to ~/.conduit/", "✓".green());
+                    println!(
+                        "  {} Identity created and saved to ~/.conduit/",
+                        "✓".green()
+                    );
                     println!(
                         "  {} Future runs will auto-authenticate (no token needed)",
                         "✓".green()
@@ -280,10 +279,7 @@ async fn cmd_init(
                 "  {} No mTLS identity found. Provide --token to bootstrap:",
                 "⚠".yellow()
             );
-            println!(
-                "    invariant init --url {} --token <your-api-token>",
-                url
-            );
+            println!("    invariant init --url {} --token <your-api-token>", url);
         }
     } else {
         println!(
@@ -302,10 +298,7 @@ async fn cmd_init(
 
     println!("\n{}", "Ready.".green().bold());
     println!("  {} to analyze your code", "invariant lens".bold());
-    println!(
-        "  {} to check for issues",
-        "invariant query orphans".bold()
-    );
+    println!("  {} to check for issues", "invariant query orphans".bold());
 
     Ok(())
 }
@@ -383,14 +376,12 @@ async fn cmd_lens(
             if let Some(language) = Language::from_extension(ext) {
                 match std::fs::read_to_string(file_path) {
                     Ok(code) => {
-                        match analyzer
-                            .lens_code(
-                                &code,
-                                language,
-                                file_path.to_str().unwrap_or("unknown"),
-                                &commit_sha,
-                            )
-                        {
+                        match analyzer.lens_code(
+                            &code,
+                            language,
+                            file_path.to_str().unwrap_or("unknown"),
+                            &commit_sha,
+                        ) {
                             Ok(result) => {
                                 total_functions += result.summary.functions;
                                 total_facts += result.facts.len();
@@ -447,7 +438,11 @@ async fn cmd_lens(
     }
 
     if errors > 0 {
-        println!("  {} {} files skipped (use -v for details)", "⚠".yellow(), errors);
+        println!(
+            "  {} {} files skipped (use -v for details)",
+            "⚠".yellow(),
+            errors
+        );
     }
 
     Ok(())
@@ -515,7 +510,10 @@ fn render_query_result(query_name: &str, result: &serde_json::Value) {
     } else if let Some(error) = result.get("error").and_then(|e| e.as_str()) {
         println!("\n{} {}", "Error:".red().bold(), error);
     } else {
-        println!("{}", serde_json::to_string_pretty(result).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(result).unwrap_or_default()
+        );
     }
 }
 
@@ -570,7 +568,10 @@ async fn cmd_diff(
                         .get("severity")
                         .and_then(|s| s.as_str())
                         .unwrap_or("?");
-                    let msg = concern.get("message").and_then(|s| s.as_str()).unwrap_or("");
+                    let msg = concern
+                        .get("message")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
                     println!("    [{}] {}", severity.to_uppercase(), msg);
                 }
             }

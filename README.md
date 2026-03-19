@@ -9,6 +9,8 @@ Invariant is a fast, multi-language code analysis tool that extracts structural 
 - **Agent feedback loop** — Real-time validation for AI-generated code
 - **Architectural governance** — Encode and enforce team invariants
 
+**[Read the paper](https://labs.datagrout.ai/papers/consequential_analysis)** · **[Library & docs](https://library.datagrout.ai)** · **[Live demo](https://app.datagrout.ai/showcase/invariant)**
+
 ## Quick Start
 
 ```bash
@@ -148,7 +150,7 @@ cargo doc --open              # API documentation
 
 ## Powered By
 
-[DataGrout](https://datagrout.ai) — Intelligence Infrastructure for Autonomous Systems
+[DataGrout](https://datagrout.ai) — The Cognitive Integration Marketplace
 
 ## License
 

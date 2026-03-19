@@ -57,14 +57,17 @@ fn unwrap_mcp_content(value: serde_json::Value) -> serde_json::Value {
 
 impl Bridge {
     async fn from_client(client: Client, url: &str) -> Result<Self> {
-        client.connect().await.context("Failed to connect to DataGrout")?;
+        client
+            .connect()
+            .await
+            .context("Failed to connect to DataGrout")?;
         tracing::info!("Connected to DataGrout at {}", url);
         Ok(Self { client })
     }
 
     /// Connect to DataGrout using auto-discovered mTLS identity.
     ///
-    /// After a successful [`bootstrap`], this is all that's needed — the
+    /// After a successful [`Bridge::bootstrap`], this is all that's needed — the
     /// Conduit SDK finds the persisted identity in `~/.conduit/` automatically.
     pub async fn connect(url: &str) -> Result<Self> {
         let client = ClientBuilder::new()
@@ -92,7 +95,7 @@ impl Bridge {
     ///
     /// Generates an ECDSA keypair, registers it with the DataGrout CA using the
     /// provided token, and persists the signed certificate to `~/.conduit/`.
-    /// Subsequent calls to [`connect`] will auto-discover it.
+    /// Subsequent calls to [`Bridge::connect`] will auto-discover it.
     pub async fn bootstrap(url: &str, token: &str, name: &str) -> Result<Self> {
         let client = ClientBuilder::new()
             .url(url)
