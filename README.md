@@ -2,6 +2,11 @@
 
 **Semantic code analysis for the AI era**
 
+[![CI](https://github.com/datagrout/invariant/actions/workflows/ci.yml/badge.svg)](https://github.com/datagrout/invariant/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/invariant-cli.svg)](https://crates.io/crates/invariant-cli)
+[![crates.io](https://img.shields.io/crates/v/invariant-core.svg?label=invariant-core)](https://crates.io/crates/invariant-core)
+[![license](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](./LICENSE)
+
 Invariant is a fast, multi-language code analysis tool that extracts structural facts from your codebase and connects to [DataGrout](https://datagrout.ai) for semantic analysis. It enables:
 
 - **Consequential analysis** — What breaks if we merge this PR?
