@@ -1,0 +1,26 @@
+# Rust
+target/
+*.rs.bk
+*.lock
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+
+# Secrets and credentials
+.env*
+*.pem
+*.key
+*.p12
+config.local.*
+
+# Invariant local files
+.invariant/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,41 @@
+[package]
+name = "invariant-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "invariant"
+path = "src/main.rs"
+
+[dependencies]
+# Core
+invariant-core = { path = "../invariant-core" }
+
+# Async
+tokio.workspace = true
+
+# CLI
+clap.workspace = true
+colored.workspace = true
+indicatif.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# MCP / Conduit
+datagrout-conduit.workspace = true
+
+# Utilities
+ignore.workspace = true
+git2.workspace = true
+toml.workspace = true
