@@ -13,6 +13,10 @@ pub struct Config {
     /// DataGrout gateway URL
     pub datagrout_url: Option<String>,
 
+    /// Bearer token fallback used when mTLS bootstrap is unavailable.
+    #[serde(default)]
+    pub access_token: Option<String>,
+
     /// Repository ID (derived from git remote or directory name)
     pub repo_id: Option<String>,
 
@@ -37,6 +41,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             datagrout_url: None,
+            access_token: None,
             repo_id: None,
             ignore_patterns: default_ignore_patterns(),
         }
@@ -85,5 +90,39 @@ impl Config {
             .map(String::from)
             .or_else(|| std::env::var("DATAGROUT_URL").ok())
             .or_else(|| self.datagrout_url.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn config_round_trips_access_token() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("invariant-config-test-{suffix}"));
+
+        let config = Config {
+            datagrout_url: Some("https://gateway.datagrout.ai/servers/test/mcp".to_string()),
+            access_token: Some("secret-token".to_string()),
+            repo_id: Some("sample-repo".to_string()),
+            ignore_patterns: vec!["target".to_string()],
+        };
+
+        let path = config.save(&temp_dir).unwrap();
+        let loaded = Config::load(&temp_dir);
+
+        assert_eq!(loaded.datagrout_url, config.datagrout_url);
+        assert_eq!(loaded.access_token, config.access_token);
+        assert_eq!(loaded.repo_id, config.repo_id);
+        assert_eq!(loaded.ignore_patterns, config.ignore_patterns);
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(temp_dir.join(".invariant")).unwrap();
+        std::fs::remove_dir(temp_dir).unwrap();
     }
 }

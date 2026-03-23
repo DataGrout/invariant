@@ -132,21 +132,34 @@ async fn require_bridge(config: &Config) -> Result<Bridge> {
         .resolve_url(None)
         .ok_or_else(|| anyhow::anyhow!("DataGrout URL not configured. Run `invariant init`."))?;
 
-    let bridge = Bridge::connect(&url).await?;
-    eprintln!("  {} Connected to DataGrout", "✓".green());
-    Ok(bridge)
+    match Bridge::connect(&url).await {
+        Ok(bridge) => {
+            eprintln!("  {} Connected to DataGrout", "✓".green());
+            Ok(bridge)
+        }
+        Err(mtls_err) => {
+            if let Some(token) = config.access_token.as_deref() {
+                let bridge = Bridge::connect_with_token(&url, token).await.map_err(|token_err| {
+                    anyhow::anyhow!(
+                        "Failed to connect to DataGrout via mTLS ({mtls_err}) or bearer token ({token_err})"
+                    )
+                })?;
+                eprintln!(
+                    "  {} Connected to DataGrout with saved bearer token",
+                    "✓".green()
+                );
+                Ok(bridge)
+            } else {
+                Err(mtls_err)
+            }
+        }
+    }
 }
 
 /// Try to connect without failing (for optional upload in lens).
 async fn try_bridge(config: &Config) -> Option<Bridge> {
-    let url = config.resolve_url(None)?;
-    match Bridge::connect(&url).await {
-        Ok(bridge) => {
-            eprintln!("  {} Connected to DataGrout", "✓".green());
-            Some(bridge)
-        }
-        Err(_) => None,
-    }
+    config.resolve_url(None)?;
+    require_bridge(config).await.ok()
 }
 
 /// Walk a directory and collect files with recognized extensions,
@@ -244,6 +257,7 @@ async fn cmd_init(
         println!("  {} {}", "Gateway:".green(), url);
 
         if Bridge::has_identity() {
+            config.access_token = None;
             println!("  {} mTLS identity found", "✓".green());
 
             match Bridge::connect(url).await {
@@ -256,6 +270,7 @@ async fn cmd_init(
             let machine_name = format!("invariant-{}", repo_id);
             match Bridge::bootstrap(url, &token, &machine_name).await {
                 Ok(_) => {
+                    config.access_token = None;
                     println!(
                         "  {} Identity created and saved to ~/.conduit/",
                         "✓".green()
@@ -267,11 +282,30 @@ async fn cmd_init(
                 }
                 Err(e) => {
                     println!("  {} Bootstrap failed: {}", "✗".red(), e);
-                    println!(
-                        "  {} You can retry with: invariant init --url {} --token <your-token>",
-                        "hint:".yellow(),
-                        url
-                    );
+
+                    match Bridge::connect_with_token(url, &token).await {
+                        Ok(_) => {
+                            config.access_token = Some(token);
+                            println!("  {} Connected with bearer token fallback", "✓".green());
+                            println!(
+                                "  {} Future runs will use the saved bearer token if mTLS is unavailable",
+                                "✓".green()
+                            );
+                        }
+                        Err(token_err) => {
+                            config.access_token = None;
+                            println!(
+                                "  {} Bearer token validation also failed: {}",
+                                "✗".red(),
+                                token_err
+                            );
+                            println!(
+                                "  {} You can retry with: invariant init --url {} --token <your-token>",
+                                "hint:".yellow(),
+                                url
+                            );
+                        }
+                    }
                 }
             }
         } else {
@@ -602,6 +636,11 @@ fn cmd_status(config: &Config) {
 
     if Bridge::has_identity() {
         println!("  {} mTLS identity present", "Identity:".green());
+    } else if config.access_token.is_some() {
+        println!(
+            "  {} Bearer token configured (mTLS bootstrap unavailable)",
+            "Identity:".yellow()
+        );
     } else {
         println!(
             "  {} No identity (run `invariant init --token <token>`)",

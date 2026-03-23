@@ -6,6 +6,17 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.2.1] - 2026-03-23
+
+### Changed
+
+- **DG identity bootstrap compatibility** — `invariant init` now aligns with the updated DataGrout / Conduit server-scoped DG identity bootstrap flow used by MCP server URLs.
+- **Bearer-token fallback** — when DG mTLS bootstrap is unavailable, Invariant can validate and persist a bearer token fallback so subsequent runs still authenticate automatically.
+- **Connection lifecycle** — bridge initialization and status reporting now reflect both DG-issued mTLS identities and saved bearer-token fallback configuration.
+- **Documentation** — README now documents the bootstrap fallback behavior and how subsequent runs reuse the saved authentication state.
+
+---
+
 ## [0.2.0] - 2026-03-19
 
 ### Added

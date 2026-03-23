@@ -22,7 +22,7 @@ Invariant is a fast, multi-language code analysis tool that extracts structural 
 # Build
 cargo build --release
 
-# Initialize (bootstraps mTLS identity automatically)
+# Initialize (bootstraps mTLS identity when available)
 invariant init --url https://gateway.datagrout.ai/servers/{uuid}/mcp --token <your-token>
 
 # Analyze your codebase (extracts structural facts + uploads to Invariant)
@@ -37,7 +37,7 @@ invariant query intent_mismatches
 invariant diff --before old.py --after new.py --goal "add rate limiting"
 ```
 
-After the first `invariant init`, no token or API key is needed again — the mTLS identity is persisted to `~/.conduit/` and auto-discovered on subsequent runs.
+After the first `invariant init`, Invariant prefers a persisted mTLS identity in `~/.conduit/`. If the gateway rejects identity bootstrap, Invariant falls back to the saved bearer token so subsequent runs still authenticate automatically.
 
 ## How It Works
 
@@ -76,7 +76,7 @@ cargo run -p invariant-cli -- lens src/
 
 ### `invariant init`
 
-Initialize Invariant for the current repository. Bootstraps an mTLS identity on first run.
+Initialize Invariant for the current repository. Bootstraps an mTLS identity on first run when the gateway supports it, otherwise saves the bearer token for future fallback auth.
 
 ```bash
 invariant init --url https://gateway.datagrout.ai/servers/{uuid}/mcp --token <token>
