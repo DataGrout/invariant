@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-output="$(./scripts/publish-crates.sh --dry-run --sleep-seconds 0)"
+output="$(./scripts/publish-crates.sh --dry-run)"
 version="$(
   awk '
     /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
@@ -27,12 +27,12 @@ assert_contains() {
   fi
 }
 
-assert_contains "Publishing crates.io release for version $version"
+assert_contains "Publishing invariant workspace v${version}"
 assert_contains "+ cargo publish -p invariant-core"
-assert_contains "Sleeping 0s so crates.io can index invariant-core"
+assert_contains "dry-run: skipping crates.io poll for invariant-core@${version}"
 assert_contains "+ cargo publish -p invariant-cli"
 assert_contains "+ git tag -a v$version -m Release v$version"
 assert_contains "+ git push origin v$version"
-assert_contains "Release flow completed for v$version"
+assert_contains "Release v${version} complete"
 
 echo "publish-crates dry-run test passed"

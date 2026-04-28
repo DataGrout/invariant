@@ -4,15 +4,22 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-sleep_seconds="${SLEEP_SECONDS:-20}"
+max_wait="${MAX_WAIT:-120}"
+poll_interval="${POLL_INTERVAL:-10}"
 dry_run=false
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/publish-crates.sh [--dry-run] [--sleep-seconds N]
+Usage: ./scripts/publish-crates.sh [--dry-run] [--max-wait N] [--poll-interval N]
 
-Publishes `invariant-core`, waits for crates.io to catch up, publishes
-`invariant-cli`, then creates and pushes a git tag for the workspace version.
+Publishes `invariant-core`, polls crates.io until the version is indexed,
+then publishes `invariant-cli` and creates/pushes a git tag.
+
+Options:
+  --dry-run          Print commands without executing them
+  --max-wait N       Max seconds to wait for crates.io indexing (default: 120)
+  --poll-interval N  Seconds between index checks (default: 10)
+  -h, --help         Show this help
 EOF
 }
 
@@ -38,14 +45,59 @@ workspace_version() {
   ' Cargo.toml
 }
 
+# Poll the crates.io sparse index until the given crate@version appears.
+wait_for_crate() {
+  local crate="$1"
+  local version="$2"
+  local waited=0
+
+  if [ "$dry_run" = true ]; then
+    echo "  (dry-run: skipping crates.io poll for ${crate}@${version})"
+    return 0
+  fi
+
+  echo "Waiting for ${crate}@${version} to appear on crates.io index (max ${max_wait}s)…"
+
+  # crates.io sparse index path: first 2 chars / next 2 chars / crate-name
+  local name_len=${#crate}
+  local index_path
+  if [ "$name_len" -le 3 ]; then
+    index_path="${name_len}/${crate}"
+  else
+    local prefix="${crate:0:2}"
+    local next="${crate:2:2}"
+    index_path="${prefix}/${next}/${crate}"
+  fi
+  local index_url="https://index.crates.io/${index_path}"
+
+  while [ "$waited" -lt "$max_wait" ]; do
+    # Each line in the sparse index is a JSON object with a "vers" field
+    if curl -fsSL "$index_url" 2>/dev/null | grep -q "\"vers\":\"${version}\""; then
+      echo "  ✓ ${crate}@${version} is indexed (after ${waited}s)"
+      return 0
+    fi
+
+    echo "  … not yet (${waited}s elapsed, retrying in ${poll_interval}s)"
+    sleep "$poll_interval"
+    waited=$((waited + poll_interval))
+  done
+
+  echo "ERROR: ${crate}@${version} did not appear on crates.io within ${max_wait}s" >&2
+  exit 1
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run)
       dry_run=true
       shift
       ;;
-    --sleep-seconds)
-      sleep_seconds="${2:-}"
+    --max-wait)
+      max_wait="${2:-}"
+      shift 2
+      ;;
+    --poll-interval)
+      poll_interval="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -60,10 +112,12 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if ! [[ "$sleep_seconds" =~ ^[0-9]+$ ]]; then
-  echo "--sleep-seconds must be a non-negative integer" >&2
-  exit 1
-fi
+for val in "$max_wait" "$poll_interval"; do
+  if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+    echo "--max-wait and --poll-interval must be non-negative integers" >&2
+    exit 1
+  fi
+done
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "This script must be run inside the invariant git repository." >&2
@@ -91,16 +145,28 @@ if git rev-parse "$tag" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Publishing crates.io release for version $version"
+echo "══════════════════════════════════════════════════════"
+echo "  Publishing invariant workspace v${version}"
+echo "══════════════════════════════════════════════════════"
+echo
+
+echo "Step 1/4: Publish invariant-core"
 run_cmd cargo publish -p invariant-core
 
-echo "Sleeping ${sleep_seconds}s so crates.io can index invariant-core"
-if [ "$dry_run" != true ] && [ "$sleep_seconds" -gt 0 ]; then
-  sleep "$sleep_seconds"
-fi
+echo
+echo "Step 2/4: Wait for crates.io to index invariant-core"
+wait_for_crate "invariant-core" "$version"
 
+echo
+echo "Step 3/4: Publish invariant-cli"
 run_cmd cargo publish -p invariant-cli
+
+echo
+echo "Step 4/4: Tag and push"
 run_cmd git tag -a "$tag" -m "Release $tag"
 run_cmd git push origin "$tag"
 
-echo "Release flow completed for $tag"
+echo
+echo "══════════════════════════════════════════════════════"
+echo "  Release $tag complete"
+echo "══════════════════════════════════════════════════════"
