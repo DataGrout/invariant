@@ -33,8 +33,13 @@ invariant query orphans
 invariant query test_gaps
 invariant query intent_mismatches
 
-# Analyze a diff against a stated goal
-invariant diff --before old.py --after new.py --goal "add rate limiting"
+# Analyze changes against a stated goal (git-native)
+invariant diff --goal "add rate limiting"                     # staged changes
+invariant diff HEAD~1 --goal "add rate limiting"              # last commit
+invariant diff main..HEAD --goal "refactor auth"              # branch diff
+
+# One-shot review: lens + diff + query on changed files
+invariant review --goal "add rate limiting"
 ```
 
 After the first `invariant init`, Invariant prefers a persisted mTLS identity in `~/.conduit/`. If the gateway rejects identity bootstrap, Invariant falls back to the saved bearer token so subsequent runs still authenticate automatically.
@@ -111,10 +116,35 @@ invariant query summary              # Aggregate statistics
 
 ### `invariant diff`
 
-Analyze code changes for goal alignment.
+Analyze code changes for goal alignment. Supports multiple input modes:
 
 ```bash
+# Git-native (default — works from any git repo)
+invariant diff --goal "add user auth"                     # staged changes vs HEAD
+invariant diff HEAD~1 --goal "add user auth"              # last commit
+invariant diff main..HEAD --goal "refactor auth"          # branch diff
+invariant diff abc123 --goal "fix billing"                # specific commit
+
+# Patch/stdin
+invariant diff --patch changes.patch --goal "add auth"
+git diff | invariant diff --stdin --goal "add auth"
+
+# Legacy file mode (for non-git contexts)
 invariant diff --before v1.py --after v2.py --goal "add user auth"
+
+# Filter to specific files
+invariant diff HEAD~1 --goal "add auth" -f src/auth.rs
+```
+
+### `invariant review`
+
+One-shot workflow: lens changed files, diff-analyze them, and run queries.
+
+```bash
+invariant review --goal "add rate limiting"                # staged changes
+invariant review HEAD~1 --goal "add rate limiting"         # last commit
+invariant review main..HEAD --goal "refactor auth"         # branch review
+invariant review --goal "fix billing" -q orphans -q test_gaps
 ```
 
 ### `invariant status`

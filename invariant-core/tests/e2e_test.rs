@@ -256,6 +256,89 @@ func unusedUtility(x int) int {
 }
 
 #[test]
+fn e2e_ruby_service() {
+    let mut analyzer = Analyzer::new().unwrap();
+    let code = r#"
+require 'json'
+require_relative 'base_service'
+
+module MyApp
+  class UserService
+    include Enumerable
+
+    def initialize(repo)
+      @repo = repo
+    end
+
+    def find(id)
+      @repo.get(id)
+    end
+
+    def list_all
+      @repo.all
+    end
+
+    private
+
+    def validate(attrs)
+      attrs.key?(:name) && attrs.key?(:email)
+    end
+
+    def normalize(attrs)
+      attrs.transform_keys(&:to_s)
+    end
+  end
+end
+"#;
+    let result = analyzer
+        .lens_code(code, Language::Ruby, "lib/my_app/user_service.rb", "rb_sha")
+        .unwrap();
+
+    assert!(
+        result.summary.functions >= 5,
+        "initialize, find, list_all, validate, normalize expected, got {}",
+        result.summary.functions
+    );
+
+    // Private methods should be detected
+    let validate_fact = result
+        .facts
+        .iter()
+        .find(|f| f.contains("'validate'") && f.starts_with("function("));
+    assert!(validate_fact.is_some(), "validate should be extracted");
+    assert!(
+        validate_fact.unwrap().contains("private"),
+        "validate should be private (after `private` block)"
+    );
+
+    // Public methods should be detected
+    let find_fact = result
+        .facts
+        .iter()
+        .find(|f| f.contains("'find'") && f.starts_with("function("));
+    assert!(find_fact.is_some(), "find should be extracted");
+    assert!(
+        find_fact.unwrap().contains("public"),
+        "find should be public"
+    );
+
+    // Dependencies
+    let deps = facts_by_predicate(&result.facts, "depends_on(");
+    assert!(deps.len() >= 2, "require 'json' + require_relative expected");
+
+    // Module/class structure
+    assert!(
+        result.facts.iter().any(|f| f.contains("'UserService'")),
+        "UserService class should appear"
+    );
+
+    // Well-formed facts
+    for fact in &result.facts {
+        assert!(fact.ends_with('.'), "malformed fact: {}", fact);
+    }
+}
+
+#[test]
 fn e2e_cross_language_consistency() {
     let mut analyzer = Analyzer::new().unwrap();
 
@@ -271,8 +354,14 @@ fn e2e_cross_language_consistency() {
     let go = analyzer
         .lens_code("package m\nfunc Hello() {}", Language::Go, "h.go", "sha")
         .unwrap();
+    let rb = analyzer
+        .lens_code("def hello; end", Language::Ruby, "h.rb", "sha")
+        .unwrap();
+    let ex = analyzer
+        .lens_code("defmodule M do\n  def hello, do: :ok\nend", Language::Elixir, "h.ex", "sha")
+        .unwrap();
 
-    for (lang, result) in [("py", &py), ("rs", &rs), ("ts", &ts), ("go", &go)] {
+    for (lang, result) in [("py", &py), ("rs", &rs), ("ts", &ts), ("go", &go), ("rb", &rb), ("ex", &ex)] {
         let func_facts = facts_by_predicate(&result.facts, "function(");
         assert!(
             !func_facts.is_empty(),

@@ -1,11 +1,16 @@
 //! Invariant CLI - Semantic code analysis for the AI era
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
-use invariant_core::{bridge::Bridge, Analyzer, Config, Language};
+use invariant_core::{
+    bridge::{Bridge, DiffAnalysis},
+    git::{self, DiffStatus, FileDiff},
+    patch, Analyzer, Config, Language,
+};
+use std::io::Read as _;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -62,22 +67,69 @@ enum Commands {
     },
 
     /// Analyze code changes against a stated goal
+    ///
+    /// Supports multiple input modes:
+    ///   invariant diff --goal "..."                    # staged changes vs HEAD
+    ///   invariant diff HEAD~1 --goal "..."             # specific commit
+    ///   invariant diff main..HEAD --goal "..."         # branch diff
+    ///   invariant diff --patch file.patch --goal "..." # from patch file
+    ///   git diff | invariant diff --stdin --goal "..." # from stdin
+    ///   invariant diff --before a.py --after b.py --goal "..." # legacy file mode
     Diff {
-        /// Path to the original file
-        #[arg(long)]
-        before: PathBuf,
+        /// Git revision spec: commit SHA, range (main..HEAD), or ref
+        #[arg(conflicts_with_all = ["before", "after", "patch", "stdin"])]
+        rev: Option<String>,
 
-        /// Path to the modified file
-        #[arg(long)]
-        after: PathBuf,
+        /// Read unified diff from a patch file
+        #[arg(long, conflicts_with_all = ["rev", "before", "after", "stdin"])]
+        patch: Option<PathBuf>,
+
+        /// Read unified diff from stdin (pipe git diff output)
+        #[arg(long, conflicts_with_all = ["rev", "before", "after", "patch"])]
+        stdin: bool,
+
+        /// Path to the original file (legacy file mode)
+        #[arg(long, requires = "after", conflicts_with_all = ["rev", "patch", "stdin"])]
+        before: Option<PathBuf>,
+
+        /// Path to the modified file (legacy file mode)
+        #[arg(long, requires = "before")]
+        after: Option<PathBuf>,
 
         /// Intent / goal the change should accomplish
         #[arg(long)]
         goal: String,
 
+        /// Filter to specific file paths (for git/patch modes)
+        #[arg(long, short)]
+        files: Vec<String>,
+
         /// Programming language (auto-detected if omitted)
         #[arg(long)]
         language: Option<String>,
+
+        /// Output format
+        #[arg(long, default_value = "text")]
+        output: OutputFormat,
+    },
+
+    /// Lens changed files, diff-analyze, and run queries in one shot
+    ///
+    /// Combines lens + diff + query into a single developer workflow:
+    ///   invariant review --goal "..."                  # staged changes
+    ///   invariant review HEAD~1 --goal "..."           # last commit
+    ///   invariant review main..HEAD --goal "..."       # branch review
+    Review {
+        /// Git revision spec (defaults to staged changes)
+        rev: Option<String>,
+
+        /// Intent / goal the change should accomplish
+        #[arg(long)]
+        goal: String,
+
+        /// Queries to run on lensed files (defaults to orphans + test_gaps)
+        #[arg(long, short)]
+        queries: Vec<String>,
 
         /// Output format
         #[arg(long, default_value = "text")]
@@ -95,25 +147,12 @@ enum OutputFormat {
 }
 
 /// Detect repo_id and commit SHA from the current git context.
+///
+/// Uses the git remote URL (normalized to `owner/repo`) for a stable
+/// identifier. Falls back to workdir folder name if no remote is set.
 fn detect_repo_context() -> (String, String) {
-    match git2::Repository::discover(".") {
-        Ok(repo) => {
-            let repo_id = repo
-                .workdir()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            let commit_sha = repo
-                .head()
-                .ok()
-                .and_then(|h| h.peel_to_commit().ok())
-                .map(|c| c.id().to_string())
-                .unwrap_or_else(|| "HEAD".to_string());
-
-            (repo_id, commit_sha)
-        }
+    match git::detect_repo_context() {
+        Ok(ctx) => (ctx.repo_id, ctx.commit_sha),
         Err(_) => ("unknown".to_string(), "HEAD".to_string()),
     }
 }
@@ -216,12 +255,27 @@ async fn main() -> Result<()> {
             output,
         } => cmd_query(&config, query, commit, output).await?,
         Commands::Diff {
+            rev,
+            patch,
+            stdin,
             before,
             after,
             goal,
+            files,
             language,
             output,
-        } => cmd_diff(&config, before, after, goal, language, output).await?,
+        } => {
+            cmd_diff(
+                &config, rev, patch, stdin, before, after, goal, files, language, output,
+            )
+            .await?
+        }
+        Commands::Review {
+            rev,
+            goal,
+            queries,
+            output,
+        } => cmd_review(&config, rev, goal, queries, output).await?,
         Commands::Status => cmd_status(&config),
     }
 
@@ -551,70 +605,375 @@ fn render_query_result(query_name: &str, result: &serde_json::Value) {
     }
 }
 
+/// Resolve the diff input mode and return file diffs.
+fn resolve_file_diffs(
+    rev: Option<String>,
+    patch_path: Option<PathBuf>,
+    stdin: bool,
+    before: Option<PathBuf>,
+    after: Option<PathBuf>,
+    files_filter: &[String],
+) -> Result<Vec<FileDiff>> {
+    let mut diffs = if let (Some(before_path), Some(after_path)) = (before, after) {
+        // Legacy file mode
+        let before_code = std::fs::read_to_string(&before_path)
+            .with_context(|| format!("Cannot read {}", before_path.display()))?;
+        let after_code = std::fs::read_to_string(&after_path)
+            .with_context(|| format!("Cannot read {}", after_path.display()))?;
+
+        let path = after_path.to_string_lossy().to_string();
+        let language = std::path::Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(Language::from_extension);
+
+        vec![FileDiff {
+            path,
+            language,
+            status: DiffStatus::Modified,
+            before: Some(before_code),
+            after: Some(after_code),
+        }]
+    } else if let Some(patch_path) = patch_path {
+        let contents = std::fs::read_to_string(&patch_path)
+            .with_context(|| format!("Cannot read patch file {}", patch_path.display()))?;
+        patch::parse_unified_diff(&contents)?
+    } else if stdin {
+        let mut contents = String::new();
+        std::io::stdin()
+            .read_to_string(&mut contents)
+            .context("Failed to read from stdin")?;
+        patch::parse_unified_diff(&contents)?
+    } else {
+        // Git-native mode
+        git::diff_from_spec(rev.as_deref())?
+    };
+
+    // Apply file filter if specified
+    if !files_filter.is_empty() {
+        diffs.retain(|d| {
+            files_filter
+                .iter()
+                .any(|f| d.path.contains(f.as_str()))
+        });
+    }
+
+    Ok(diffs)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn cmd_diff(
     config: &Config,
-    before: PathBuf,
-    after: PathBuf,
+    rev: Option<String>,
+    patch_path: Option<PathBuf>,
+    stdin: bool,
+    before: Option<PathBuf>,
+    after: Option<PathBuf>,
     goal: String,
+    files_filter: Vec<String>,
     language: Option<String>,
     output: OutputFormat,
 ) -> Result<()> {
+    let diffs = resolve_file_diffs(rev, patch_path, stdin, before, after, &files_filter)?;
+
+    if diffs.is_empty() {
+        println!("{} No changes found.", "→".cyan().bold());
+        return Ok(());
+    }
+
     let bridge = require_bridge(config).await?;
 
-    let before_code = std::fs::read_to_string(&before)?;
-    let after_code = std::fs::read_to_string(&after)?;
+    println!(
+        "{} Analyzing {} file{}...",
+        "→".cyan().bold(),
+        diffs.len(),
+        if diffs.len() == 1 { "" } else { "s" }
+    );
 
-    println!("{} Analyzing diff...", "→".cyan().bold());
+    let mut all_analyses: Vec<(String, DiffAnalysis)> = Vec::new();
 
-    let analysis = bridge
-        .diff_analyze(&before_code, &after_code, &goal, language.as_deref(), None)
-        .await?;
+    for diff in &diffs {
+        let before_code = diff.before.as_deref().unwrap_or("");
+        let after_code = diff.after.as_deref().unwrap_or("");
 
+        if before_code.is_empty() && after_code.is_empty() {
+            continue;
+        }
+
+        let auto_lang = diff.language.map(|l| l.name().to_string());
+        let lang = language.as_deref().or(auto_lang.as_deref());
+
+        println!("  {} {}", status_icon(diff.status), diff.path.dimmed());
+
+        let analysis = bridge
+            .diff_analyze(before_code, after_code, &goal, lang, None)
+            .await?;
+
+        all_analyses.push((diff.path.clone(), analysis));
+    }
+
+    render_diff_results(&all_analyses, &output)?;
+    Ok(())
+}
+
+fn status_icon(status: DiffStatus) -> colored::ColoredString {
+    match status {
+        DiffStatus::Added => "+".green().bold(),
+        DiffStatus::Deleted => "-".red().bold(),
+        DiffStatus::Modified => "~".yellow().bold(),
+        DiffStatus::Renamed => "→".cyan().bold(),
+    }
+}
+
+fn render_diff_results(
+    analyses: &[(String, DiffAnalysis)],
+    output: &OutputFormat,
+) -> Result<()> {
     match output {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&analysis)?),
+        OutputFormat::Json => {
+            let json: Vec<serde_json::Value> = analyses
+                .iter()
+                .map(|(path, a)| {
+                    let mut v = serde_json::to_value(a).unwrap_or_default();
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("file".to_string(), serde_json::json!(path));
+                    }
+                    v
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        }
         OutputFormat::Text => {
-            println!(
-                "\n{} Alignment score: {:.0}%",
-                "Result:".green().bold(),
-                analysis.alignment_score * 100.0
-            );
+            if analyses.len() == 1 {
+                render_single_diff_analysis(&analyses[0].0, &analyses[0].1);
+            } else {
+                // Multi-file summary
+                let avg_score: f64 = if analyses.is_empty() {
+                    0.0
+                } else {
+                    analyses.iter().map(|(_, a)| a.alignment_score).sum::<f64>()
+                        / analyses.len() as f64
+                };
 
-            if let Some(reasoning) = &analysis.alignment_reasoning {
-                println!("  {}", reasoning);
-            }
+                println!(
+                    "\n{} {} files analyzed, average alignment: {:.0}%",
+                    "Summary:".green().bold(),
+                    analyses.len(),
+                    avg_score * 100.0
+                );
 
-            if let Some(changes) = analysis.changes_detected.as_object() {
-                println!("\n  {}:", "Changes".bold());
-                for (key, val) in changes {
-                    if let Some(arr) = val.as_array() {
-                        if !arr.is_empty() {
-                            let items: Vec<String> = arr.iter().map(|v| v.to_string()).collect();
-                            println!("    {}: {}", key, items.join(", "));
+                for (path, analysis) in analyses {
+                    let score_pct = analysis.alignment_score * 100.0;
+                    let score_color = if score_pct >= 80.0 {
+                        format!("{:.0}%", score_pct).green()
+                    } else if score_pct >= 50.0 {
+                        format!("{:.0}%", score_pct).yellow()
+                    } else {
+                        format!("{:.0}%", score_pct).red()
+                    };
+                    println!("  {} {}", score_color, path);
+
+                    if !analysis.concerns.is_empty() {
+                        for concern in &analysis.concerns {
+                            let severity = concern
+                                .get("severity")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("?");
+                            let msg = concern
+                                .get("message")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("");
+                            println!("       [{}] {}", severity.to_uppercase(), msg);
                         }
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
 
-            if !analysis.concerns.is_empty() {
-                println!("\n  {}:", "Concerns".bold());
-                for concern in &analysis.concerns {
-                    let severity = concern
-                        .get("severity")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("?");
-                    let msg = concern
-                        .get("message")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-                    println!("    [{}] {}", severity.to_uppercase(), msg);
+fn render_single_diff_analysis(path: &str, analysis: &DiffAnalysis) {
+    println!(
+        "\n{} {} — alignment: {:.0}%",
+        "Result:".green().bold(),
+        path,
+        analysis.alignment_score * 100.0
+    );
+
+    if let Some(reasoning) = &analysis.alignment_reasoning {
+        println!("  {}", reasoning);
+    }
+
+    if let Some(changes) = analysis.changes_detected.as_object() {
+        println!("\n  {}:", "Changes".bold());
+        for (key, val) in changes {
+            if let Some(arr) = val.as_array() {
+                if !arr.is_empty() {
+                    let items: Vec<String> = arr.iter().map(|v| v.to_string()).collect();
+                    println!("    {}: {}", key, items.join(", "));
                 }
             }
+        }
+    }
 
-            if !analysis.unexpected_changes.is_empty() {
-                println!("\n  {}:", "Unexpected Changes".bold());
-                for change in &analysis.unexpected_changes {
-                    println!("    - {}", change);
+    if !analysis.concerns.is_empty() {
+        println!("\n  {}:", "Concerns".bold());
+        for concern in &analysis.concerns {
+            let severity = concern
+                .get("severity")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let msg = concern
+                .get("message")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            println!("    [{}] {}", severity.to_uppercase(), msg);
+        }
+    }
+
+    if !analysis.unexpected_changes.is_empty() {
+        println!("\n  {}:", "Unexpected Changes".bold());
+        for change in &analysis.unexpected_changes {
+            println!("    - {}", change);
+        }
+    }
+}
+
+// ============================================================================
+// Review command — lens + diff + query in one shot
+// ============================================================================
+
+async fn cmd_review(
+    config: &Config,
+    rev: Option<String>,
+    goal: String,
+    queries: Vec<String>,
+    output: OutputFormat,
+) -> Result<()> {
+    let diffs = git::diff_from_spec(rev.as_deref())?;
+
+    if diffs.is_empty() {
+        println!("{} No changes found.", "→".cyan().bold());
+        return Ok(());
+    }
+
+    let bridge = require_bridge(config).await?;
+    let (repo_id, commit_sha) = detect_repo_context();
+    let mut analyzer = Analyzer::new()?;
+
+    // Phase 1: Lens changed files
+    let lensable: Vec<&FileDiff> = diffs
+        .iter()
+        .filter(|d| d.after.is_some() && d.language.is_some())
+        .collect();
+
+    println!(
+        "{} Reviewing {} changed file{}...",
+        "→".cyan().bold(),
+        diffs.len(),
+        if diffs.len() == 1 { "" } else { "s" }
+    );
+
+    if !lensable.is_empty() {
+        println!("\n{} Lensing {} file{}...", "1.".bold(), lensable.len(), if lensable.len() == 1 { "" } else { "s" });
+
+        for diff in &lensable {
+            let code = diff.after.as_ref().unwrap();
+            let lang = diff.language.unwrap();
+
+            print!("   {} {} ", status_icon(diff.status), diff.path.dimmed());
+
+            if let Ok(_result) = analyzer.lens_code(code, lang, &diff.path, &commit_sha) {
+                if bridge
+                    .upload_facts(code, lang.name(), &diff.path, &commit_sha, Some(&repo_id))
+                    .await
+                    .is_ok()
+                {
+                    println!("{}", "✓".green());
+                } else {
+                    println!("{}", "⚠ upload failed".yellow());
                 }
+            } else {
+                println!("{}", "⚠ parse failed".yellow());
+            }
+        }
+    }
+
+    // Phase 2: Diff analysis
+    let diffable: Vec<&FileDiff> = diffs
+        .iter()
+        .filter(|d| {
+            d.before.is_some() || d.after.is_some()
+        })
+        .collect();
+
+    if !diffable.is_empty() {
+        println!(
+            "\n{} Analyzing {} diff{}...",
+            "2.".bold(),
+            diffable.len(),
+            if diffable.len() == 1 { "" } else { "s" }
+        );
+
+        let mut analyses = Vec::new();
+
+        for diff in &diffable {
+            let before_code = diff.before.as_deref().unwrap_or("");
+            let after_code = diff.after.as_deref().unwrap_or("");
+
+            if before_code.is_empty() && after_code.is_empty() {
+                continue;
+            }
+
+            let auto_lang = diff.language.map(|l| l.name().to_string());
+
+            match bridge.diff_analyze(before_code, after_code, &goal, auto_lang.as_deref(), None).await {
+                Ok(analysis) => analyses.push((diff.path.clone(), analysis)),
+                Err(e) => {
+                    println!(
+                        "   {} {} — {}",
+                        "⚠".yellow(),
+                        diff.path.dimmed(),
+                        e
+                    );
+                }
+            }
+        }
+
+        if !analyses.is_empty() {
+            render_diff_results(&analyses, &output)?;
+        }
+    }
+
+    // Phase 3: Run queries
+    let query_names: Vec<String> = if queries.is_empty() {
+        vec!["orphans".to_string(), "test_gaps".to_string()]
+    } else {
+        queries
+    };
+
+    println!(
+        "\n{} Running {} quer{}...",
+        "3.".bold(),
+        query_names.len(),
+        if query_names.len() == 1 { "y" } else { "ies" }
+    );
+
+    for query_name in &query_names {
+        match bridge.query(&repo_id, query_name, Some(&commit_sha)).await {
+            Ok(result) => {
+                match output {
+                    OutputFormat::Json => {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    }
+                    OutputFormat::Text => {
+                        render_query_result(query_name, &result);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("   {} {} — {}", "⚠".yellow(), query_name, e);
             }
         }
     }

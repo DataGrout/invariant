@@ -6,6 +6,26 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.0] - 2026-04-27
+
+### Added
+
+- **Git-native diff analysis** — `invariant diff` now works directly with the git index and history. Supports staged changes (default), single commit (`HEAD~1`), and range diffs (`main..HEAD`) without needing explicit file paths.
+- **Patch and stdin input** — `invariant diff --patch file.patch` and `git diff | invariant diff --stdin` allow diff analysis from patch files or piped output.
+- **Multi-file diff output** — when a diff spans multiple files, each is analyzed independently with per-file alignment scores and a color-coded summary.
+- **File filter** — `invariant diff -f src/auth.rs` scopes analysis to specific paths within a larger diff.
+- **`invariant review` command** — one-shot workflow that lenses changed files, diff-analyzes them against a goal, and runs queries (defaults to `orphans` + `test_gaps`) in a single invocation.
+- **`git` module** (`invariant-core`) — repo discovery, stable `owner/repo` identifier resolution from remote URLs (SSH, HTTPS, ssh://), HEAD commit detection, and staged/commit/range diff extraction via `git2`.
+- **`patch` module** (`invariant-core`) — unified diff parser that reconstructs before/after file content from `git diff` output or `.patch` files. Handles added, deleted, modified, and renamed files with quoted path support.
+
+### Changed
+
+- **Repo identity** — `detect_repo_context` now normalizes remote URLs to `owner/repo` format instead of using the workdir folder name, producing stable identifiers across clones.
+- **`diff` command interface** — the former `--before` / `--after` file mode is preserved as legacy but no longer the default. Git-native mode requires no file paths.
+- **`git2` dependency** — moved from CLI-only to `invariant-core` to support the new `git` and `patch` modules.
+
+---
+
 ## [0.2.2] - 2026-03-23
 
 ### Changed
