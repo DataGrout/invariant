@@ -28,6 +28,8 @@ assert_contains() {
 }
 
 assert_contains "Publishing invariant workspace v${version}"
+assert_contains "Formatting OK"
+assert_contains "Tests pass"
 assert_contains "+ cargo publish -p invariant-core"
 assert_contains "dry-run: skipping crates.io poll for invariant-core@${version}"
 assert_contains "+ cargo publish -p invariant-cli"

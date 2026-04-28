@@ -152,9 +152,7 @@ fn parse_diff_header(header: &str) -> Result<(String, String)> {
     // Format: a/path b/path (or "a/path" "b/path" for paths with spaces)
     if let Some(stripped) = rest.strip_prefix('"') {
         // Quoted paths — find matching closing quotes
-        let end_first = stripped
-            .find('"')
-            .context("Malformed quoted diff header")?;
+        let end_first = stripped.find('"').context("Malformed quoted diff header")?;
         let first = &stripped[..end_first];
         let second_part = stripped[end_first + 1..].trim_start();
         let second = if second_part.starts_with('"') {
@@ -162,10 +160,7 @@ fn parse_diff_header(header: &str) -> Result<(String, String)> {
         } else {
             second_part
         };
-        Ok((
-            strip_ab_prefix(first),
-            strip_ab_prefix(second),
-        ))
+        Ok((strip_ab_prefix(first), strip_ab_prefix(second)))
     } else {
         // Unquoted: split on " b/" boundary
         // Find the last occurrence of " b/" to handle paths with spaces
@@ -177,10 +172,7 @@ fn parse_diff_header(header: &str) -> Result<(String, String)> {
             // Fallback: split in half
             let parts: Vec<&str> = rest.splitn(2, ' ').collect();
             if parts.len() == 2 {
-                Ok((
-                    strip_ab_prefix(parts[0]),
-                    strip_ab_prefix(parts[1]),
-                ))
+                Ok((strip_ab_prefix(parts[0]), strip_ab_prefix(parts[1])))
             } else {
                 anyhow::bail!("Cannot parse diff header: {header}")
             }
@@ -413,8 +405,7 @@ index 111..222 100644
 
     #[test]
     fn parse_diff_header_rename_different_paths() {
-        let (old, new) =
-            parse_diff_header("diff --git a/src/old.rs b/src/new.rs").unwrap();
+        let (old, new) = parse_diff_header("diff --git a/src/old.rs b/src/new.rs").unwrap();
         assert_eq!(old, "src/old.rs");
         assert_eq!(new, "src/new.rs");
     }

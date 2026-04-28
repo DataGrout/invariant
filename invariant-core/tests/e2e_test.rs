@@ -324,7 +324,10 @@ end
 
     // Dependencies
     let deps = facts_by_predicate(&result.facts, "depends_on(");
-    assert!(deps.len() >= 2, "require 'json' + require_relative expected");
+    assert!(
+        deps.len() >= 2,
+        "require 'json' + require_relative expected"
+    );
 
     // Module/class structure
     assert!(
@@ -358,10 +361,22 @@ fn e2e_cross_language_consistency() {
         .lens_code("def hello; end", Language::Ruby, "h.rb", "sha")
         .unwrap();
     let ex = analyzer
-        .lens_code("defmodule M do\n  def hello, do: :ok\nend", Language::Elixir, "h.ex", "sha")
+        .lens_code(
+            "defmodule M do\n  def hello, do: :ok\nend",
+            Language::Elixir,
+            "h.ex",
+            "sha",
+        )
         .unwrap();
 
-    for (lang, result) in [("py", &py), ("rs", &rs), ("ts", &ts), ("go", &go), ("rb", &rb), ("ex", &ex)] {
+    for (lang, result) in [
+        ("py", &py),
+        ("rs", &rs),
+        ("ts", &ts),
+        ("go", &go),
+        ("rb", &rb),
+        ("ex", &ex),
+    ] {
         let func_facts = facts_by_predicate(&result.facts, "function(");
         assert!(
             !func_facts.is_empty(),

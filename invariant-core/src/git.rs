@@ -123,7 +123,10 @@ fn normalize_remote_url(url: &str) -> Option<String> {
 
 /// Strip trailing slashes and `.git` suffix from a repo path segment.
 fn clean_repo_path(path: &str) -> String {
-    path.trim_matches('/').trim_end_matches(".git").trim_matches('/').to_string()
+    path.trim_matches('/')
+        .trim_end_matches(".git")
+        .trim_matches('/')
+        .to_string()
 }
 
 /// Get repo context: stable `repo_id` + current HEAD commit SHA.
@@ -148,10 +151,7 @@ pub fn detect_repo_context() -> Result<RepoContext> {
 /// This is the default when the user runs `invariant diff --goal "..."` with no rev.
 pub fn diff_staged() -> Result<Vec<FileDiff>> {
     let repo = discover_repo()?;
-    let head_tree = repo
-        .head()
-        .ok()
-        .and_then(|h| h.peel_to_tree().ok());
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
 
     let mut opts = DiffOptions::new();
     opts.include_untracked(false);
@@ -199,9 +199,11 @@ pub fn diff_range(base: &str, head: &str) -> Result<Vec<FileDiff>> {
         .revparse_single(head)
         .with_context(|| format!("Cannot resolve head revision '{head}'"))?;
 
-    let base_tree = base_obj.peel_to_tree()
+    let base_tree = base_obj
+        .peel_to_tree()
         .with_context(|| format!("'{base}' does not point to a tree"))?;
-    let head_tree = head_obj.peel_to_tree()
+    let head_tree = head_obj
+        .peel_to_tree()
         .with_context(|| format!("'{head}' does not point to a tree"))?;
 
     let diff = repo

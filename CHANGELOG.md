@@ -6,6 +6,21 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.1] - 2026-04-27
+
+### Fixed
+
+- **Formatting** — fixed `cargo fmt` violations in test files that shipped with 0.3.0.
+
+### Added
+
+- **Expanded test coverage** — patch parser edge cases (renamed files, binary diffs, empty input, no-newline-at-EOF, quoted paths), `DiffMode` dispatch parsing, Ruby e2e test, cross-language consistency now covers Ruby and Elixir.
+- **`DiffMode` enum** — extracted rev spec parsing into a testable `parse_diff_spec()` function.
+- **`clean_repo_path` helper** — fixes URL normalization for remotes with trailing slashes.
+- **Pre-publish gate** — `publish-crates.sh` now runs `cargo fmt --check` and `cargo test` before publishing, and polls the crates.io index instead of sleeping a fixed duration.
+
+---
+
 ## [0.3.0] - 2026-04-27
 
 ### Added

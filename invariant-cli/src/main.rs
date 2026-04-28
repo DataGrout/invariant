@@ -651,11 +651,7 @@ fn resolve_file_diffs(
 
     // Apply file filter if specified
     if !files_filter.is_empty() {
-        diffs.retain(|d| {
-            files_filter
-                .iter()
-                .any(|f| d.path.contains(f.as_str()))
-        });
+        diffs.retain(|d| files_filter.iter().any(|f| d.path.contains(f.as_str())));
     }
 
     Ok(diffs)
@@ -725,10 +721,7 @@ fn status_icon(status: DiffStatus) -> colored::ColoredString {
     }
 }
 
-fn render_diff_results(
-    analyses: &[(String, DiffAnalysis)],
-    output: &OutputFormat,
-) -> Result<()> {
+fn render_diff_results(analyses: &[(String, DiffAnalysis)], output: &OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Json => {
             let json: Vec<serde_json::Value> = analyses
@@ -876,7 +869,12 @@ async fn cmd_review(
     );
 
     if !lensable.is_empty() {
-        println!("\n{} Lensing {} file{}...", "1.".bold(), lensable.len(), if lensable.len() == 1 { "" } else { "s" });
+        println!(
+            "\n{} Lensing {} file{}...",
+            "1.".bold(),
+            lensable.len(),
+            if lensable.len() == 1 { "" } else { "s" }
+        );
 
         for diff in &lensable {
             let code = diff.after.as_ref().unwrap();
@@ -903,9 +901,7 @@ async fn cmd_review(
     // Phase 2: Diff analysis
     let diffable: Vec<&FileDiff> = diffs
         .iter()
-        .filter(|d| {
-            d.before.is_some() || d.after.is_some()
-        })
+        .filter(|d| d.before.is_some() || d.after.is_some())
         .collect();
 
     if !diffable.is_empty() {
@@ -928,15 +924,13 @@ async fn cmd_review(
 
             let auto_lang = diff.language.map(|l| l.name().to_string());
 
-            match bridge.diff_analyze(before_code, after_code, &goal, auto_lang.as_deref(), None).await {
+            match bridge
+                .diff_analyze(before_code, after_code, &goal, auto_lang.as_deref(), None)
+                .await
+            {
                 Ok(analysis) => analyses.push((diff.path.clone(), analysis)),
                 Err(e) => {
-                    println!(
-                        "   {} {} — {}",
-                        "⚠".yellow(),
-                        diff.path.dimmed(),
-                        e
-                    );
+                    println!("   {} {} — {}", "⚠".yellow(), diff.path.dimmed(), e);
                 }
             }
         }
@@ -962,16 +956,14 @@ async fn cmd_review(
 
     for query_name in &query_names {
         match bridge.query(&repo_id, query_name, Some(&commit_sha)).await {
-            Ok(result) => {
-                match output {
-                    OutputFormat::Json => {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
-                    }
-                    OutputFormat::Text => {
-                        render_query_result(query_name, &result);
-                    }
+            Ok(result) => match output {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
                 }
-            }
+                OutputFormat::Text => {
+                    render_query_result(query_name, &result);
+                }
+            },
             Err(e) => {
                 println!("   {} {} — {}", "⚠".yellow(), query_name, e);
             }

@@ -150,19 +150,35 @@ echo "  Publishing invariant workspace v${version}"
 echo "══════════════════════════════════════════════════════"
 echo
 
-echo "Step 1/4: Publish invariant-core"
+echo "Step 1/5: Pre-publish checks"
+echo "  Checking formatting…"
+if ! cargo fmt --all -- --check 2>/dev/null; then
+  echo "ERROR: cargo fmt check failed. Run 'cargo fmt --all' and commit." >&2
+  exit 1
+fi
+echo "  ✓ Formatting OK"
+
+echo "  Running tests…"
+if ! cargo test --quiet 2>/dev/null; then
+  echo "ERROR: tests failed. Fix them before publishing." >&2
+  exit 1
+fi
+echo "  ✓ Tests pass"
+
+echo
+echo "Step 2/5: Publish invariant-core"
 run_cmd cargo publish -p invariant-core
 
 echo
-echo "Step 2/4: Wait for crates.io to index invariant-core"
+echo "Step 3/5: Wait for crates.io to index invariant-core"
 wait_for_crate "invariant-core" "$version"
 
 echo
-echo "Step 3/4: Publish invariant-cli"
+echo "Step 4/5: Publish invariant-cli"
 run_cmd cargo publish -p invariant-cli
 
 echo
-echo "Step 4/4: Tag and push"
+echo "Step 5/5: Tag and push"
 run_cmd git tag -a "$tag" -m "Release $tag"
 run_cmd git push origin "$tag"
 
