@@ -113,6 +113,27 @@ impl Bridge {
         datagrout_conduit::ConduitIdentity::try_default().is_some()
     }
 
+    /// Full autonomous onboarding: onramp registration + mTLS identity bootstrap.
+    ///
+    /// Does not require an existing DataGrout URL or account. Returns the connected
+    /// bridge along with the MCP server URL provisioned for this agent. Saves the
+    /// mTLS identity to `~/.conduit/` so subsequent `Bridge::connect` calls are
+    /// token-free.
+    pub async fn onboard(
+        opts: datagrout_conduit::OnrampOptions,
+    ) -> Result<(Self, String)> {
+        let (creds, token) = datagrout_conduit::register_and_exchange(&opts)
+            .await
+            .context("Onramp registration failed")?;
+
+        let url = creds
+            .mcp_url
+            .ok_or_else(|| anyhow::anyhow!("DataGrout did not provision an MCP server URL"))?;
+
+        let bridge = Self::bootstrap(&url, &token, &opts.agent_name).await?;
+        Ok((bridge, url))
+    }
+
     /// Upload locally-extracted facts to `invariant.code_lens` for server-side
     /// persistence and optional LLM intent enrichment.
     pub async fn upload_facts(

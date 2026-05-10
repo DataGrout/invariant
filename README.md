@@ -22,7 +22,10 @@ Invariant is a fast, multi-language code analysis tool that extracts structural 
 # Build
 cargo build --release
 
-# Initialize (bootstraps mTLS identity when available)
+# New to DataGrout? Create a free account and register automatically:
+invariant onboard
+
+# Already have an account — initialize with your server URL:
 invariant init --url https://gateway.datagrout.ai/servers/{uuid}/mcp --token <your-token>
 
 # Analyze your codebase (extracts structural facts + uploads to Invariant)
@@ -78,6 +81,17 @@ cargo run -p invariant-cli -- lens src/
 ```
 
 ## Commands
+
+### `invariant onboard`
+
+Create a free DataGrout account and register an agent identity — no prior account or URL needed. Runs the full onramp flow: account creation → OAuth credentials → mTLS identity bootstrap → saves config ready for `invariant lens`.
+
+```bash
+invariant onboard                          # interactive (human)
+invariant onboard --agent --name my-agent  # non-interactive (CI / autonomous)
+```
+
+When `invariant init` is run with no URL configured and stdin is a terminal, it will offer to run onboarding inline.
 
 ### `invariant init`
 

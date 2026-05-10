@@ -10,6 +10,7 @@ use invariant_core::{
     git::{self, DiffStatus, FileDiff},
     patch, Analyzer, Config, Language,
 };
+use datagrout_conduit::OnrampOptions;
 use std::io::Read as _;
 use std::path::PathBuf;
 
@@ -138,6 +139,20 @@ enum Commands {
 
     /// Show connection and configuration status
     Status,
+
+    /// Create a DataGrout account and get your server URL — no prior account needed
+    ///
+    /// For humans:     invariant onboard
+    /// For agents:     invariant onboard --agent --name my-agent
+    Onboard {
+        /// Agent or machine name used to identify this instance (defaults to hostname)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Agent mode — skips interactive prompts, suitable for CI or automated pipelines
+        #[arg(long)]
+        agent: bool,
+    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -277,6 +292,9 @@ async fn main() -> Result<()> {
             output,
         } => cmd_review(&config, rev, goal, queries, output).await?,
         Commands::Status => cmd_status(&config),
+        Commands::Onboard { name, agent } => {
+            cmd_onboard(&project_root, config, name, agent).await?
+        }
     }
 
     Ok(())
@@ -371,10 +389,66 @@ async fn cmd_init(
         }
     } else {
         println!(
-            "\n  {} No DataGrout URL configured. Provide one to enable remote features:",
+            "\n  {} No DataGrout URL configured.",
             "⚠".yellow()
         );
-        println!("    invariant init --url https://gateway.datagrout.ai/servers/{{uuid}}/mcp");
+
+        // Offer to create an account if running interactively.
+        use std::io::IsTerminal as _;
+        if std::io::stdin().is_terminal() {
+            print!("  {} Create a free DataGrout account now? [Y/n] ", "→".cyan());
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut answer = String::new();
+            let _ = std::io::stdin().read_line(&mut answer);
+            let answer = answer.trim().to_lowercase();
+
+            if answer.is_empty() || answer == "y" || answer == "yes" {
+                let hostname = std::env::var("HOSTNAME")
+                    .or_else(|_| std::env::var("COMPUTERNAME"))
+                    .unwrap_or_else(|_| "machine".to_string());
+                let agent_name = format!("invariant-{}", hostname);
+
+                println!("\n  {} Registering with DataGrout...", "→".cyan());
+
+                match Bridge::onboard(OnrampOptions {
+                    gateway: "https://app.datagrout.ai".to_string(),
+                    agent_name: agent_name.clone(),
+                    agent_type: Some(format!("invariant/{}", invariant_core::VERSION)),
+                    intended_use: Some("Semantic code analysis via Invariant CLI".to_string()),
+                    access_code: None,
+                })
+                .await
+                {
+                    Ok((_, server_url)) => {
+                        config.datagrout_url = Some(server_url.clone());
+                        println!("  {} Account created!", "✓".green());
+                        println!("  {} {}", "Server URL:".green(), server_url);
+                        println!(
+                            "  {} mTLS identity saved to ~/.conduit/ — no tokens needed going forward",
+                            "✓".green()
+                        );
+                    }
+                    Err(e) => {
+                        println!("  {} Registration failed: {}", "✗".red(), e);
+                        println!("  {} You can try again later with: invariant onboard", "hint:".yellow());
+                        println!(
+                            "  {} Or provide an existing URL: invariant init --url <your-url>",
+                            "hint:".yellow()
+                        );
+                    }
+                }
+            } else {
+                println!("  Skipped. Run {} to sign up later.", "invariant onboard".bold());
+                println!(
+                    "  Or: invariant init --url https://gateway.datagrout.ai/servers/{{uuid}}/mcp"
+                );
+            }
+        } else {
+            println!("  Run {} to create an account.", "invariant onboard".bold());
+            println!(
+                "  Or: invariant init --url https://gateway.datagrout.ai/servers/{{uuid}}/mcp"
+            );
+        }
     }
 
     let config_path = config.save(project_root)?;
@@ -967,6 +1041,122 @@ async fn cmd_review(
             Err(e) => {
                 println!("   {} {} — {}", "⚠".yellow(), query_name, e);
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_onboard(
+    project_root: &std::path::Path,
+    mut config: Config,
+    name: Option<String>,
+    agent: bool,
+) -> Result<()> {
+    println!("{}", "DataGrout Onboarding".blue().bold());
+
+    // Check if already configured.
+    if let Some(ref url) = config.datagrout_url {
+        if Bridge::has_identity() {
+            println!(
+                "  {} Already connected to {}",
+                "✓".green(),
+                url
+            );
+            println!("  Run {} to rerun setup or change the URL.", "invariant init".bold());
+            return Ok(());
+        }
+    }
+
+    // Determine agent name: flag > hostname env > fallback.
+    let agent_name = name.unwrap_or_else(|| {
+        let host = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "machine".to_string());
+        format!("invariant-{}", host)
+    });
+
+    if !agent {
+        // Human-facing: show what we're about to do.
+        println!("  {} {}", "Name:".green(), agent_name);
+        println!("  {} {}", "Gateway:".green(), "app.datagrout.ai");
+        println!();
+        println!(
+            "  This will create a DataGrout account and provision a private MCP server for you."
+        );
+        println!(
+            "  Your mTLS identity will be saved to {} — no tokens needed afterward.",
+            "~/.conduit/".bold()
+        );
+        println!();
+
+        // Confirm before proceeding (unless stdin is not a terminal).
+        use std::io::IsTerminal as _;
+        if std::io::stdin().is_terminal() {
+            print!("  Continue? [Y/n] ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut answer = String::new();
+            let _ = std::io::stdin().read_line(&mut answer);
+            let answer = answer.trim().to_lowercase();
+            if !answer.is_empty() && answer != "y" && answer != "yes" {
+                println!("  Cancelled.");
+                return Ok(());
+            }
+        }
+    }
+
+    println!("\n  {} Registering with DataGrout...", "→".cyan());
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Contacting DataGrout...");
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    match Bridge::onboard(OnrampOptions {
+        gateway: "https://app.datagrout.ai".to_string(),
+        agent_name: agent_name.clone(),
+        agent_type: Some(format!("invariant/{}", invariant_core::VERSION)),
+        intended_use: Some("Semantic code analysis via Invariant CLI".to_string()),
+        access_code: None,
+    })
+    .await
+    {
+        Ok((_, server_url)) => {
+            pb.finish_and_clear();
+            config.datagrout_url = Some(server_url.clone());
+            config.repo_id = {
+                let (repo_id, _) = detect_repo_context();
+                if repo_id != "unknown" { Some(repo_id) } else { None }
+            };
+
+            let config_path = config.save(project_root)?;
+
+            println!("  {} Account created!", "✓".green().bold());
+            println!("  {} {}", "Server URL:".green(), server_url);
+            println!("  {} mTLS identity saved to ~/.conduit/", "✓".green());
+            println!(
+                "  {} Config saved to {}",
+                "✓".green(),
+                config_path.display()
+            );
+            println!();
+            println!("{}", "Ready to go!".green().bold());
+            println!("  {} to analyze your code", "invariant lens".bold());
+            println!("  {} to check for issues", "invariant query orphans".bold());
+        }
+        Err(e) => {
+            pb.finish_and_clear();
+            println!("  {} Registration failed: {}", "✗".red().bold(), e);
+            println!();
+            println!("  If the error persists:");
+            println!("    • Check your internet connection");
+            println!("    • Visit https://app.datagrout.ai to sign up manually");
+            println!("    • Then run: {} --url <your-server-url>", "invariant init".bold());
+            return Err(e);
         }
     }
 

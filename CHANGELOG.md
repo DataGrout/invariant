@@ -6,6 +6,21 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.0] - 2026-05-10
+
+### Added
+
+- **`invariant onboard` command** — create a DataGrout account and register an agent identity directly from the CLI, no prior account or URL needed. Interactive for humans; pass `--agent` to skip prompts for CI and autonomous pipelines.
+- **Auto-prompting in `invariant init`** — when no URL is configured and stdin is a terminal, `init` now asks whether to create a free DataGrout account inline and runs the full onboarding + bootstrap flow if accepted.
+- **`Bridge::onboard`** (`invariant-core`) — new method that performs the two-step DG onramp handshake (registration → token exchange → mTLS identity bootstrap) and returns a ready-to-use `Bridge` and the provisioned server URL.
+- **Onboarding integration tests** — `invariant-core/tests/bridge_onboard_test.rs` covers the full `Bridge::onboard` flow, gated by `DG_GATEWAY_URL` env var for CI environments with live access.
+
+### Changed
+
+- **Conduit SDK** updated to 0.5.0 (adds `onramp` feature — `register_and_exchange`, `OnrampOptions`).
+
+---
+
 ## [0.3.1] - 2026-04-27
 
 ### Fixed
