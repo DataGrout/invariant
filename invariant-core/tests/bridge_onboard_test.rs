@@ -75,7 +75,10 @@ async fn test_onboard_url_is_valid_mcp_endpoint() {
     .expect("onboard failed");
 
     // URL must be parseable and use https.
-    assert!(url.starts_with("https://"), "expected https URL, got: {url}");
+    assert!(
+        url.starts_with("https://"),
+        "expected https URL, got: {url}"
+    );
 
     // Must look like an MCP server URL.
     assert!(
@@ -124,7 +127,9 @@ async fn test_onboard_is_idempotent() {
     };
 
     let (_, url1) = Bridge::onboard(opts()).await.expect("first onboard failed");
-    let (_, url2) = Bridge::onboard(opts()).await.expect("second onboard failed");
+    let (_, url2) = Bridge::onboard(opts())
+        .await
+        .expect("second onboard failed");
 
     assert_eq!(url1, url2, "repeated onboard returned different URLs");
 }
@@ -147,7 +152,7 @@ async fn test_onboard_invalid_gateway_errors_cleanly() {
         "expected error for invalid gateway, got success"
     );
 
-    let msg = format!("{}", result.unwrap_err());
+    let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
     assert!(
         !msg.is_empty(),
         "error message should explain what went wrong"

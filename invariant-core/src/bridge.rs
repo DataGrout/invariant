@@ -119,9 +119,7 @@ impl Bridge {
     /// bridge along with the MCP server URL provisioned for this agent. Saves the
     /// mTLS identity to `~/.conduit/` so subsequent `Bridge::connect` calls are
     /// token-free.
-    pub async fn onboard(
-        opts: datagrout_conduit::OnrampOptions,
-    ) -> Result<(Self, String)> {
+    pub async fn onboard(opts: datagrout_conduit::OnrampOptions) -> Result<(Self, String)> {
         let (creds, token) = datagrout_conduit::register_and_exchange(&opts)
             .await
             .context("Onramp registration failed")?;

@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use datagrout_conduit::OnrampOptions;
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use invariant_core::{
@@ -10,7 +11,6 @@ use invariant_core::{
     git::{self, DiffStatus, FileDiff},
     patch, Analyzer, Config, Language,
 };
-use datagrout_conduit::OnrampOptions;
 use std::io::Read as _;
 use std::path::PathBuf;
 
@@ -388,15 +388,15 @@ async fn cmd_init(
             println!("    invariant init --url {} --token <your-api-token>", url);
         }
     } else {
-        println!(
-            "\n  {} No DataGrout URL configured.",
-            "⚠".yellow()
-        );
+        println!("\n  {} No DataGrout URL configured.", "⚠".yellow());
 
         // Offer to create an account if running interactively.
         use std::io::IsTerminal as _;
         if std::io::stdin().is_terminal() {
-            print!("  {} Create a free DataGrout account now? [Y/n] ", "→".cyan());
+            print!(
+                "  {} Create a free DataGrout account now? [Y/n] ",
+                "→".cyan()
+            );
             let _ = std::io::Write::flush(&mut std::io::stdout());
             let mut answer = String::new();
             let _ = std::io::stdin().read_line(&mut answer);
@@ -430,7 +430,10 @@ async fn cmd_init(
                     }
                     Err(e) => {
                         println!("  {} Registration failed: {}", "✗".red(), e);
-                        println!("  {} You can try again later with: invariant onboard", "hint:".yellow());
+                        println!(
+                            "  {} You can try again later with: invariant onboard",
+                            "hint:".yellow()
+                        );
                         println!(
                             "  {} Or provide an existing URL: invariant init --url <your-url>",
                             "hint:".yellow()
@@ -438,7 +441,10 @@ async fn cmd_init(
                     }
                 }
             } else {
-                println!("  Skipped. Run {} to sign up later.", "invariant onboard".bold());
+                println!(
+                    "  Skipped. Run {} to sign up later.",
+                    "invariant onboard".bold()
+                );
                 println!(
                     "  Or: invariant init --url https://gateway.datagrout.ai/servers/{{uuid}}/mcp"
                 );
@@ -1058,12 +1064,11 @@ async fn cmd_onboard(
     // Check if already configured.
     if let Some(ref url) = config.datagrout_url {
         if Bridge::has_identity() {
+            println!("  {} Already connected to {}", "✓".green(), url);
             println!(
-                "  {} Already connected to {}",
-                "✓".green(),
-                url
+                "  Run {} to rerun setup or change the URL.",
+                "invariant init".bold()
             );
-            println!("  Run {} to rerun setup or change the URL.", "invariant init".bold());
             return Ok(());
         }
     }
@@ -1079,7 +1084,7 @@ async fn cmd_onboard(
     if !agent {
         // Human-facing: show what we're about to do.
         println!("  {} {}", "Name:".green(), agent_name);
-        println!("  {} {}", "Gateway:".green(), "app.datagrout.ai");
+        println!("  {} app.datagrout.ai", "Gateway:".green());
         println!();
         println!(
             "  This will create a DataGrout account and provision a private MCP server for you."
@@ -1130,7 +1135,11 @@ async fn cmd_onboard(
             config.datagrout_url = Some(server_url.clone());
             config.repo_id = {
                 let (repo_id, _) = detect_repo_context();
-                if repo_id != "unknown" { Some(repo_id) } else { None }
+                if repo_id != "unknown" {
+                    Some(repo_id)
+                } else {
+                    None
+                }
             };
 
             let config_path = config.save(project_root)?;
@@ -1155,7 +1164,10 @@ async fn cmd_onboard(
             println!("  If the error persists:");
             println!("    • Check your internet connection");
             println!("    • Visit https://app.datagrout.ai to sign up manually");
-            println!("    • Then run: {} --url <your-server-url>", "invariant init".bold());
+            println!(
+                "    • Then run: {} --url <your-server-url>",
+                "invariant init".bold()
+            );
             return Err(e);
         }
     }
