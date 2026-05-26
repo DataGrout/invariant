@@ -1297,34 +1297,34 @@ pub fn run() {}
 
         // Both Order::new and OrderItem::new must coexist as distinct ids.
         assert!(
-            ids.iter().any(|id| *id == "order_new_0"),
+            ids.contains(&"order_new_0"),
             "expected order_new_0 in {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| *id == "orderitem_new_0"),
+            ids.contains(&"orderitem_new_0"),
             "expected orderitem_new_0 in {ids:?}"
         );
 
         // Same for the cancel methods — they have the same arity but different
         // Self types and must not collide.
         assert!(
-            ids.iter().any(|id| *id == "order_cancel_1"),
+            ids.contains(&"order_cancel_1"),
             "expected order_cancel_1 in {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| *id == "orderitem_cancel_1"),
+            ids.contains(&"orderitem_cancel_1"),
             "expected orderitem_cancel_1 in {ids:?}"
         );
 
         // The free function `run` keeps the legacy unqualified form.
         assert!(
-            ids.iter().any(|id| *id == "run_0"),
+            ids.contains(&"run_0"),
             "free function run should remain unqualified, got {ids:?}"
         );
 
         // And there should be NO bare `new_0` id (would indicate collision).
         assert!(
-            !ids.iter().any(|id| *id == "new_0"),
+            !ids.contains(&"new_0"),
             "bare new_0 should not exist — impl methods must be qualified: {ids:?}"
         );
     }
