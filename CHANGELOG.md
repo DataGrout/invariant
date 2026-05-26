@@ -6,6 +6,22 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.1] - 2026-05-25
+
+### Fixed
+
+- **Rust impl methods no longer collide on `func_id`** — when two structs in the same module defined a method with the same name and arity (e.g. `impl Order { fn new }` and `impl OrderItem { fn new }`), the analyzer previously emitted the same `func_id` (`new_0`) for both, silently overwriting one in any downstream Prolog fact store keyed by id. Impl method ids are now qualified with the `Self` type: `order_new_0` and `orderitem_new_0`. Free (non-impl) functions are unchanged — `fn run` still emits `run_0`.
+
+### Added
+
+- **Regression test for struct-qualified function ids** — `test_rust_impl_methods_are_struct_qualified` in `analyzer.rs` covers the collision case (two structs with same-name methods), the same-arity cancel-method case, the free-function preservation case, and asserts no bare unqualified id leaks out for impl methods.
+
+### Downstream impact
+
+- Consumers that store lens facts keyed by `func_id` (e.g. DataGrout LC namespaces uploaded via `manifold lens --upload`) will see new ids for impl methods after re-lensing. Re-running `manifold lens --upload --namespace <ns>` is sufficient — the lens upload retracts the previous `tag: "lens"` facts and asserts the fresh ones in one batch, so cleanup is automatic.
+
+---
+
 ## [0.4.0] - 2026-05-10
 
 ### Added

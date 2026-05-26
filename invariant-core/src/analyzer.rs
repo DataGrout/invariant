@@ -295,7 +295,7 @@ fn analyze_rust(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     for node in root.children(&mut cursor) {
         match node.kind() {
             "function_item" => {
-                analyze_rust_function(&node, &module_id, ctx)?;
+                analyze_rust_function(&node, &module_id, None, ctx)?;
             }
             "struct_item" | "enum_item" | "trait_item" => {
                 analyze_rust_type(&node, &module_id, ctx)?;
@@ -316,13 +316,27 @@ fn analyze_rust(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
-fn analyze_rust_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+/// `impl_type_prefix` qualifies impl method IDs with the Self type name so that
+/// `impl OrderItem { fn new }` → `orderitem_new_3` and `impl Order { fn new }` →
+/// `order_new_3`, avoiding collisions when different structs define methods with
+/// the same name and arity.  Pass `None` for top-level free functions.
+fn analyze_rust_function(
+    node: &Node<'_>,
+    module_id: &str,
+    impl_type_prefix: Option<&str>,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
     let name_node = node
         .child_by_field_name("name")
         .ok_or_else(|| Error::Parse("Function has no name".to_string()))?;
     let func_name = node_text(&name_node, ctx.code);
     let arity = param_count(node, "parameters");
-    let func_id = normalize_id(&format!("{}_{}", func_name, arity));
+    let func_id = match impl_type_prefix {
+        Some(prefix) if !prefix.is_empty() => {
+            normalize_id(&format!("{}_{}_{}", prefix, func_name, arity))
+        }
+        _ => normalize_id(&format!("{}_{}", func_name, arity)),
+    };
     let line = node_line(node);
 
     let visibility = if has_pub_modifier(node, ctx.code) {
@@ -357,11 +371,20 @@ fn analyze_rust_type(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Res
 }
 
 fn analyze_rust_impl(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    // Extract the Self type being implemented (e.g. `Order` from `impl Order { … }`
+    // or `AppState` from `impl AppState { … }`).  We use this as a prefix in the
+    // func_id so that `impl OrderItem { fn new }` → `orderitem_new_3` and
+    // `impl Order { fn new }` → `order_new_3`, avoiding silent collisions when
+    // multiple structs define a method with the same name and arity.
+    let type_prefix: Option<String> = node
+        .child_by_field_name("type")
+        .map(|n| normalize_id(node_text(&n, ctx.code)));
+
     let body = node.child_by_field_name("body").unwrap_or(*node);
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         if child.kind() == "function_item" {
-            analyze_rust_function(&child, module_id, ctx)?;
+            analyze_rust_function(&child, module_id, type_prefix.as_deref(), ctx)?;
         }
     }
 
@@ -1227,6 +1250,82 @@ end
             vis_for("targeted_method").as_deref(),
             Some("private"),
             "targeted_method should be private (via private :method_name)"
+        );
+    }
+
+    #[test]
+    fn test_rust_impl_methods_are_struct_qualified() {
+        // Regression: before this fix, both `impl Order { fn new }` and
+        // `impl OrderItem { fn new }` produced func_id `new_0`, silently
+        // colliding when downstream tools query by id.  The Self type is now
+        // prefixed onto the id: `order_new_0` vs `orderitem_new_0`.  Free
+        // (non-impl) functions are unchanged: `fn run` → `run_0`.
+        let mut analyzer = Analyzer::new().unwrap();
+
+        let code = r#"
+pub struct Order;
+pub struct OrderItem;
+
+impl Order {
+    pub fn new() -> Self { Order }
+    pub fn cancel(&self) {}
+}
+
+impl OrderItem {
+    pub fn new() -> Self { OrderItem }
+    pub fn cancel(&self) {}
+}
+
+pub fn run() {}
+"#;
+
+        let result = analyzer
+            .lens_code(code, Language::Rust, "src/order.rs", "abc123")
+            .unwrap();
+
+        // Collect every function/4 id from the emitted Prolog facts.
+        let ids: Vec<&str> = result
+            .facts
+            .iter()
+            .filter(|f| f.starts_with("function("))
+            .filter_map(|f| {
+                let inner = f.strip_prefix("function(")?;
+                let id_quoted = inner.split(',').next()?.trim();
+                Some(id_quoted.trim_matches('\''))
+            })
+            .collect();
+
+        // Both Order::new and OrderItem::new must coexist as distinct ids.
+        assert!(
+            ids.iter().any(|id| *id == "order_new_0"),
+            "expected order_new_0 in {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| *id == "orderitem_new_0"),
+            "expected orderitem_new_0 in {ids:?}"
+        );
+
+        // Same for the cancel methods — they have the same arity but different
+        // Self types and must not collide.
+        assert!(
+            ids.iter().any(|id| *id == "order_cancel_1"),
+            "expected order_cancel_1 in {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| *id == "orderitem_cancel_1"),
+            "expected orderitem_cancel_1 in {ids:?}"
+        );
+
+        // The free function `run` keeps the legacy unqualified form.
+        assert!(
+            ids.iter().any(|id| *id == "run_0"),
+            "free function run should remain unqualified, got {ids:?}"
+        );
+
+        // And there should be NO bare `new_0` id (would indicate collision).
+        assert!(
+            !ids.iter().any(|id| *id == "new_0"),
+            "bare new_0 should not exist — impl methods must be qualified: {ids:?}"
         );
     }
 }
