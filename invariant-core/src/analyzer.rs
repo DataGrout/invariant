@@ -84,6 +84,7 @@ impl Analyzer {
 // Helpers
 // ========================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn emit_function(
     ctx: &mut Ctx<'_>,
     func_id: &str,
@@ -92,6 +93,7 @@ fn emit_function(
     arity: usize,
     visibility: &str,
     line: usize,
+    fn_node: &Node<'_>,
 ) {
     ctx.facts.push(Fact::new(
         "function",
@@ -122,7 +124,123 @@ fn emit_function(
         ],
     ));
 
+    emit_params(ctx, func_id, fn_node);
+
     ctx.summary.functions += 1;
+}
+
+/// Emit `function_param(FuncId, Position, Name, Type)` for each parameter of a
+/// function node.  Deterministic (tree-sitter), language-agnostic via a set of
+/// common parameter-list node kinds + per-param name/type field heuristics.
+/// Type is the atom `unknown` when the language/declaration omits it.
+fn emit_params(ctx: &mut Ctx<'_>, func_id: &str, fn_node: &Node<'_>) {
+    let Some(params) = find_params_node(fn_node) else {
+        return;
+    };
+
+    let mut cursor = params.walk();
+    let mut pos: i64 = 0;
+    for child in params.named_children(&mut cursor) {
+        match child.kind() {
+            "comment" | "line_comment" | "block_comment" => continue,
+            _ => {}
+        }
+
+        let (name, ty) = extract_param(&child, ctx.code);
+        if name.is_empty() {
+            continue;
+        }
+
+        let type_val = if ty.is_empty() {
+            FactValue::Atom("unknown".to_string())
+        } else {
+            FactValue::String(ty)
+        };
+
+        ctx.facts.push(Fact::new(
+            "function_param",
+            vec![
+                FactValue::String(func_id.to_string()),
+                FactValue::Integer(pos),
+                FactValue::String(name),
+                type_val,
+            ],
+        ));
+        pos += 1;
+    }
+}
+
+/// Locate the parameter-list node for a function across languages.
+fn find_params_node<'a>(fn_node: &Node<'a>) -> Option<Node<'a>> {
+    fn_node
+        .child_by_field_name("parameters")
+        .or_else(|| fn_node.child_by_field_name("arguments"))
+        .or_else(|| find_child_by_kind(fn_node, "parameters"))
+        .or_else(|| find_child_by_kind(fn_node, "formal_parameters"))
+        .or_else(|| find_child_by_kind(fn_node, "parameter_list"))
+        .or_else(|| find_child_by_kind(fn_node, "method_parameters"))
+        .or_else(|| find_child_by_kind(fn_node, "block_parameters"))
+}
+
+/// Extract a `(name, type)` pair from a single parameter node.  Heuristic and
+/// defensive — falls back to the trimmed node text for the name and an empty
+/// type when fields aren't present.
+fn extract_param(node: &Node<'_>, code: &[u8]) -> (String, String) {
+    // Rust receiver — `&self` / `self`.
+    if node.kind() == "self_parameter" {
+        return ("self".to_string(), String::new());
+    }
+
+    // A bare identifier parameter (untyped, e.g. Python `x`, Ruby `x`).
+    if node.kind() == "identifier" {
+        return (clean_param(node_text(node, code)), String::new());
+    }
+
+    let name = node
+        .child_by_field_name("pattern")
+        .or_else(|| node.child_by_field_name("name"))
+        .map(|n| node_text(&n, code).to_string())
+        .or_else(|| first_identifier_text(node, code))
+        .unwrap_or_else(|| node_text(node, code).to_string());
+
+    let ty = node
+        .child_by_field_name("type")
+        .or_else(|| find_child_by_kind(node, "type_annotation"))
+        .map(|n| node_text(&n, code).to_string())
+        .unwrap_or_default();
+
+    // Some grammars (e.g. TypeScript) expose the type as a `type_annotation`
+    // that includes the leading `:` — normalise it away so the type is the
+    // bare type text (`number`, not `: number`).
+    let ty = ty.trim().trim_start_matches(':').trim().to_string();
+
+    (clean_param(&name), clean_param(&ty))
+}
+
+/// First descendant `identifier`'s text (DFS), if any.
+fn first_identifier_text(node: &Node<'_>, code: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "identifier" {
+            return Some(node_text(&child, code).to_string());
+        }
+        if let Some(found) = first_identifier_text(&child, code) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Collapse whitespace/newlines and cap length so a param name/type is a clean,
+/// single-line token even when derived from messy source text.
+fn clean_param(s: &str) -> String {
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim_matches(|c| c == ',' || c == '(' || c == ')');
+    if trimmed.len() > 80 {
+        trimmed.chars().take(80).collect()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn emit_module(ctx: &mut Ctx<'_>, module_id: &str, module_name: &str, filepath: &str, line: usize) {
@@ -236,7 +354,7 @@ fn analyze_python_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) 
         "public"
     };
 
-    emit_function(ctx, &func_id, module_id, func_name, arity, visibility, line);
+    emit_function(ctx, &func_id, module_id, func_name, arity, visibility, line, node);
 
     if let Some(body) = node.child_by_field_name("body") {
         analyze_calls(&body, ctx.code, &func_id, ctx, "call")?;
@@ -345,7 +463,7 @@ fn analyze_rust_function(
         "private"
     };
 
-    emit_function(ctx, &func_id, module_id, func_name, arity, visibility, line);
+    emit_function(ctx, &func_id, module_id, func_name, arity, visibility, line, node);
 
     if let Some(body) = node.child_by_field_name("body") {
         analyze_calls(&body, ctx.code, &func_id, ctx, "call_expression")?;
@@ -475,7 +593,7 @@ fn analyze_js_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
     let func_id = normalize_id(&format!("{}_{}", name, arity));
     let line = node_line(node);
 
-    emit_function(ctx, &func_id, module_id, &name, arity, "public", line);
+    emit_function(ctx, &func_id, module_id, &name, arity, "public", line, node);
 
     if let Some(body) = node.child_by_field_name("body") {
         analyze_calls(&body, ctx.code, &func_id, ctx, "call_expression")?;
@@ -564,7 +682,7 @@ fn analyze_go_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
         "private"
     };
 
-    emit_function(ctx, &func_id, module_id, &name, arity, visibility, line);
+    emit_function(ctx, &func_id, module_id, &name, arity, visibility, line, node);
 
     if let Some(body) = node.child_by_field_name("body") {
         analyze_calls(&body, ctx.code, &func_id, ctx, "call_expression")?;
@@ -705,7 +823,7 @@ fn analyze_elixir_function(
     let visibility = if kind == "defp" { "private" } else { "public" };
 
     emit_function(
-        ctx, &func_id, module_id, &func_name, arity, visibility, line,
+        ctx, &func_id, module_id, &func_name, arity, visibility, line, node,
     );
 
     if let Some(do_block) = find_child_by_kind(node, "do_block") {
@@ -931,7 +1049,7 @@ fn analyze_ruby_method(
     let func_id = normalize_id(&format!("{}_{}", name, arity));
     let line = node_line(node);
 
-    emit_function(ctx, &func_id, module_id, &name, arity, visibility, line);
+    emit_function(ctx, &func_id, module_id, &name, arity, visibility, line, node);
 
     if let Some(body) = node.child_by_field_name("body") {
         analyze_ruby_calls(&body, ctx.code, &func_id, ctx)?;
@@ -1021,8 +1139,10 @@ fn analyze_calls(
     for child in node.children(&mut cursor) {
         if child.kind() == call_kind {
             if let Some(func_node) = child.child_by_field_name("function") {
-                let called_func = node_text(&func_node, code);
-                emit_call(ctx, func_id, called_func, node_line(&child));
+                let called_func = callee_name(&func_node, code);
+                if !called_func.is_empty() {
+                    emit_call(ctx, func_id, &called_func, node_line(&child));
+                }
             }
         }
         analyze_calls(&child, code, func_id, ctx, call_kind)?;
@@ -1031,9 +1151,238 @@ fn analyze_calls(
     Ok(())
 }
 
+/// Extract a clean callee name from a call's `function` node.
+///
+/// The naive `node_text(function_node)` is wrong for chained / method calls:
+/// for `a.b().c()` the outer call's `function` field is the *entire*
+/// `a.b().c` expression — including the inner call's arguments and any
+/// newlines — which produced multi-line garbage like
+/// `"Self::git_output(&[...]\n.map"` in the fact base.
+///
+/// The inner call is captured independently by the recursion in
+/// [`analyze_calls`], so at each node we only want *this* call's callee:
+/// - member/field/attribute/selector access → the method/field name, prefixed
+///   with the receiver only when it's a simple single-token identifier (so
+///   `order.advance` survives but `<nested call>.advance` collapses to
+///   `advance`);
+/// - everything else (plain identifier, Rust `A::b` scoped path) → its text,
+///   passed through [`sanitize_callee`] as a final guard against any
+///   language/node-kind we didn't special-case.
+fn callee_name(func_node: &Node<'_>, code: &[u8]) -> String {
+    match func_node.kind() {
+        // Rust `x.method`, JS `obj.prop`, Python `obj.attr`, Go `pkg.Field`.
+        "field_expression" | "member_expression" | "attribute" | "selector_expression" => {
+            let method = func_node
+                .child_by_field_name("field")
+                .or_else(|| func_node.child_by_field_name("property"))
+                .or_else(|| func_node.child_by_field_name("attribute"))
+                .or_else(|| func_node.child_by_field_name("name"))
+                .map(|n| node_text(&n, code))
+                .unwrap_or("");
+
+            let receiver = func_node
+                .child_by_field_name("value")
+                .or_else(|| func_node.child_by_field_name("object"))
+                .or_else(|| func_node.child_by_field_name("operand"));
+
+            match receiver {
+                // Keep a simple qualifier for readability (and nav suffix-match
+                // still resolves the bare method); never a nested call.
+                Some(r) if is_simple_receiver(&r) => {
+                    format!("{}.{}", node_text(&r, code), method)
+                }
+                _ => method.to_string(),
+            }
+        }
+        _ => sanitize_callee(node_text(func_node, code)),
+    }
+}
+
+/// A receiver is "simple" when it's a single, single-line token — safe to keep
+/// as a qualifier.  Anything containing a call, parentheses, or a newline is
+/// not, so we'd drop it and keep only the method name.
+fn is_simple_receiver(node: &Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "identifier" | "self" | "scoped_identifier" | "field_identifier" | "type_identifier"
+    )
+}
+
+/// Final guard: collapse any callee text that still looks like an expression
+/// (contains a newline or `(`) down to a clean trailing symbol.  Defends every
+/// node-kind we didn't special-case across languages.
+fn sanitize_callee(text: &str) -> String {
+    if !text.contains('\n') && !text.contains('(') {
+        return text.trim().to_string();
+    }
+    // Take the part before the first `(`, then the final `.`/`::`-segment.
+    let head = text.split('(').next().unwrap_or(text);
+    let head = head.replace(['\n', '\r', '\t', ' '], "");
+    head.rsplit(['.'])
+        .next()
+        .unwrap_or(&head)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_callee_produces_clean_single_token() {
+        // The exact shape of the observed bug — the contract is "no newline,
+        // no paren, no whitespace", not a specific token (the field_expression
+        // path handles real chains; this is only the catch-all fallback).
+        let garbage = "Self::git_output(&[\"tag\", \"-l\"], &self.path)\n            .map";
+        let out = sanitize_callee(garbage);
+        assert!(!out.contains('\n') && !out.contains('(') && !out.contains(' '), "not clean: {out:?}");
+        assert!(!out.is_empty());
+
+        // Clean names pass through untouched.
+        assert_eq!(sanitize_callee("foo"), "foo");
+        assert_eq!(sanitize_callee("Module::bar"), "Module::bar");
+    }
+
+    #[test]
+    fn rust_method_chain_emits_clean_callees_no_newlines() {
+        let mut analyzer = Analyzer::new().unwrap();
+        let code = r#"
+pub fn run(&self) -> bool {
+    let x = self.git_output(&["tag", "-l", "manifold-base"])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    helper(x)
+}
+"#;
+        let result = analyzer
+            .lens_code(code, Language::Rust, "lib.rs", "abc")
+            .unwrap();
+
+        let calls: Vec<&String> = result
+            .facts
+            .iter()
+            .filter(|f| f.starts_with("calls_external("))
+            .collect();
+
+        // No callee fact may contain a newline or an opening paren (the bug).
+        for f in &calls {
+            assert!(!f.contains('\n'), "callee fact has newline: {f}");
+            // The fact itself has parens (it's a predicate); check the callee arg.
+            // calls_external('caller','unknown','CALLEE',0,line).
+            let callee = f.split('\'').nth(5).unwrap_or("");
+            assert!(
+                !callee.contains('(') && !callee.contains('\n') && !callee.contains(' '),
+                "callee arg is not clean: {callee:?} in {f}"
+            );
+        }
+
+        // The chain's method names are captured individually.
+        let joined = calls.iter().fold(String::new(), |a, f| a + f);
+        assert!(joined.contains("git_output"), "missing git_output: {joined}");
+        assert!(joined.contains("map"), "missing map: {joined}");
+        assert!(joined.contains("unwrap_or"), "missing unwrap_or: {joined}");
+        assert!(joined.contains("helper"), "missing helper: {joined}");
+    }
+
+    #[test]
+    fn rust_function_params_capture_name_and_type() {
+        let mut analyzer = Analyzer::new().unwrap();
+        let code = "pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
+        let result = analyzer
+            .lens_code(code, Language::Rust, "lib.rs", "abc")
+            .unwrap();
+
+        let params: Vec<&String> = result
+            .facts
+            .iter()
+            .filter(|f| f.starts_with("function_param("))
+            .collect();
+
+        assert_eq!(params.len(), 2, "expected 2 params, got: {params:?}");
+        let joined = params.iter().fold(String::new(), |a, f| a + f);
+        // Position, name and type all present.
+        assert!(joined.contains("'a'"), "missing param a: {joined}");
+        assert!(joined.contains("'b'"), "missing param b: {joined}");
+        assert!(joined.contains("'i32'"), "missing type i32: {joined}");
+        // Positions are 0 and 1.
+        assert!(params.iter().any(|f| f.contains(", 0,")));
+        assert!(params.iter().any(|f| f.contains(", 1,")));
+    }
+
+    #[test]
+    fn rust_self_receiver_is_captured_then_typed_params() {
+        let mut analyzer = Analyzer::new().unwrap();
+        let code = "impl S { pub fn m(&self, n: u8) {} }\n";
+        let result = analyzer
+            .lens_code(code, Language::Rust, "lib.rs", "abc")
+            .unwrap();
+        let joined = result
+            .facts
+            .iter()
+            .filter(|f| f.starts_with("function_param("))
+            .fold(String::new(), |a, f| a + f);
+        assert!(joined.contains("'self'"), "self receiver missing: {joined}");
+        assert!(joined.contains("'n'") && joined.contains("'u8'"), "typed param missing: {joined}");
+    }
+
+    #[test]
+    fn cross_language_function_params() {
+        let mut analyzer = Analyzer::new().unwrap();
+
+        let params = |a: &mut Analyzer, code: &str, lang: Language, file: &str| -> String {
+            a.lens_code(code, lang, file, "x")
+                .unwrap()
+                .facts
+                .into_iter()
+                .filter(|f| f.starts_with("function_param("))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // JavaScript — names, untyped → unknown.
+        let js = params(&mut analyzer, "function f(a, b) { return a; }", Language::JavaScript, "x.js");
+        assert!(js.contains("'a'") && js.contains("'b'"), "js: {js}");
+        assert!(js.contains("unknown"), "js untyped should be unknown: {js}");
+
+        // TypeScript — type captured WITHOUT the leading colon.
+        let ts = params(
+            &mut analyzer,
+            "function g(a: number, b: string): number { return a; }",
+            Language::TypeScript,
+            "x.ts",
+        );
+        assert!(ts.contains("'number'"), "ts type should be bare 'number': {ts}");
+        assert!(ts.contains("'string'"), "ts type should be bare 'string': {ts}");
+        assert!(!ts.contains(": number"), "ts type must not keep the colon: {ts}");
+
+        // Go — typed params.
+        let go = params(&mut analyzer, "func Add(a int, b int) int { return a }", Language::Go, "x.go");
+        assert!(go.contains("'a'") && go.contains("'int'"), "go: {go}");
+
+        // Ruby — names, dynamically typed → unknown.
+        let rb = params(&mut analyzer, "def greet(name, count)\n  name\nend\n", Language::Ruby, "x.rb");
+        assert!(rb.contains("'name'") && rb.contains("'count'"), "rb: {rb}");
+        assert!(rb.contains("unknown"), "rb untyped should be unknown: {rb}");
+    }
+
+    #[test]
+    fn python_function_params_capture_names_untyped_are_unknown() {
+        let mut analyzer = Analyzer::new().unwrap();
+        let code = "def greet(name, count):\n    return name\n";
+        let result = analyzer
+            .lens_code(code, Language::Python, "m.py", "abc")
+            .unwrap();
+        let params: Vec<&String> = result
+            .facts
+            .iter()
+            .filter(|f| f.starts_with("function_param("))
+            .collect();
+        let joined = params.iter().fold(String::new(), |a, f| a + f);
+        assert!(joined.contains("'name'"), "missing name: {joined}");
+        assert!(joined.contains("'count'"), "missing count: {joined}");
+        // No type annotations → type atom is `unknown` (unquoted atom).
+        assert!(joined.contains("unknown"), "untyped params should be unknown: {joined}");
+    }
 
     #[test]
     fn test_analyze_python_simple() {

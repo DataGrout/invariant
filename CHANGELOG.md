@@ -6,6 +6,28 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.5.0] - 2026-05-26
+
+### Added
+
+- **Parameter facts — `function_param(FuncId, Position, Name, Type)`** — the analyzer now emits one fact per function parameter, deterministically from tree-sitter, so downstream consumers get full call signatures (not just arity). `Position` is zero-based; `Name` is the parameter identifier; `Type` is the declared type text, or the atom `unknown` when the language/declaration omits it. Verified across Rust, Python, JavaScript, TypeScript, Go, and Ruby. The Rust `self` / `&self` receiver is captured as a parameter named `self`. (`emit_params` / `find_params_node` / `extract_param` in `analyzer.rs`.)
+- **Cross-language parameter tests** — `rust_function_params_capture_name_and_type`, `rust_self_receiver_is_captured_then_typed_params`, `python_function_params_capture_names_untyped_are_unknown`, and `cross_language_function_params` (JS / TS / Go / Ruby, including the TypeScript colon-stripping case).
+
+### Fixed
+
+- **Clean call-graph callees — no more multi-line garbage** — `analyze_calls` previously captured the full node text of a chained-call expression, so a callee could come out as `"Self::git_output(&[...]\n  .map"` (newlines, parens, the whole expression). Method / field / attribute / selector calls now resolve to just the method name (plus a simple receiver where unambiguous), inner calls are captured by recursion, and a final `sanitize_callee` guard collapses any residual newline / paren / whitespace. Callee atoms are now clean single tokens. (`callee_name` / `is_simple_receiver` / `sanitize_callee`, +2 tests.)
+- **TypeScript parameter types no longer keep the leading colon** — a `type_annotation` exposed as `: number` is normalised to the bare type `number`.
+
+### Downstream impact
+
+- Consumers re-lensing after this release will see new `function_param/4` facts and cleaner `calls_external` callee atoms. Re-running `manifold lens --upload --namespace <ns>` is sufficient — the per-file lens upload retracts the previous facts and asserts the fresh ones, so cleanup is automatic. In DataGrout, `nav_func_report/2` surfaces the parameters as an ordered `params` list and `manifold read_function` renders the signature line.
+
+### Known limitations
+
+- **Elixir parameters are not extracted.** An Elixir `def f(a, b)` parses as a `call` node without a `parameters` / `arguments` field, so `function_param` facts are not emitted for `.ex` sources. (DataGrout lenses Elixir via its native AST path, not invariant-core, so this does not affect the DG Elixir lens.)
+
+---
+
 ## [0.4.1] - 2026-05-25
 
 ### Fixed
