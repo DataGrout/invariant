@@ -6,7 +6,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["DataGrout AI"]
 license = "Elastic-2.0"
@@ -26,6 +26,9 @@ tree-sitter-javascript = "0.23"
 tree-sitter-go = "0.23"
 tree-sitter-elixir = "0.3"
 tree-sitter-ruby = "0.23"
+# MIT Prolog grammar maintained in the sibling tree-sitter-grammars repo.
+# Path for local workspace builds; version for crates.io publication.
+tree-sitter-prolog = { path = "../tree-sitter-grammars/tree-sitter-prolog", version = "0.1" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

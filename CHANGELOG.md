@@ -6,6 +6,25 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.6.0] - 2026-05-27
+
+### Added
+
+- **Prolog support — `Language::Prolog` + `analyze_prolog`** — Invariant now lenses Prolog source (`.pl` / `.plt` / `.pro` / `.prolog`) into the same fact vocabulary as the imperative languages, powered by the MIT-licensed [`tree-sitter-prolog`](https://github.com/DataGrout/tree-sitter-grammars/tree/main/tree-sitter-prolog) grammar maintained alongside this repo. Mapping:
+  - a **predicate** (name/arity) is the unit — one `function` fact per predicate, with an extra `function_line` per additional clause (predicates are deduped across their clauses);
+  - **head arguments** become positional `function_param` facts (type `unknown` — Prolog is untyped);
+  - **body goals** become `calls_external` facts, recursing only through the control operators `, ; -> *-> |` and treating each goal's functor (including infix goals like `=` / `is`) as the callee;
+  - `:- module(Name, Exports)` drives **visibility** (exported predicates are `public`, others `private`; with no module directive everything is `public`);
+  - `:- use_module(...)` / `:- ensure_loaded(...)` / `:- consult(...)` become `depends_on` facts (`library(lists)` unwraps to `lists`);
+  - ProbLog annotated clauses (`0.5::heads :- toss.`) resolve to the annotated head predicate (`heads/0`).
+- **Prolog tests** — `prolog_predicates_params_calls_and_visibility` and `prolog_problog_annotation_resolves_head_predicate` in `analyzer.rs`, plus `test_parse_prolog` / `test_language_prolog_from_extension` in `parser.rs`.
+
+### Notes
+
+- The grammar is a **superset** (ISO core + SWI dicts + ProbLog `::` + DCG). It was validated to parse **all 92** Prolog files under `data-grout` as well as [`logic-batteries`](https://github.com/DataGrout/logic-batteries) with zero error nodes. Dialect detection (ISO-conformance, SWI-only constructs) is intentionally a downstream concern, not the grammar's.
+
+---
+
 ## [0.5.0] - 2026-05-26
 
 ### Added

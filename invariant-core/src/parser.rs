@@ -22,6 +22,8 @@ pub enum Language {
     Elixir,
     /// Ruby
     Ruby,
+    /// Prolog (ISO + SWI + ProbLog superset)
+    Prolog,
 }
 
 impl Language {
@@ -36,6 +38,7 @@ impl Language {
             "go" => Some(Language::Go),
             "ex" | "exs" => Some(Language::Elixir),
             "rb" | "rake" | "gemspec" => Some(Language::Ruby),
+            "pl" | "plt" | "pro" | "prolog" => Some(Language::Prolog),
             _ => None,
         }
     }
@@ -51,6 +54,7 @@ impl Language {
             Language::Go => &["go"],
             Language::Elixir => &["ex", "exs"],
             Language::Ruby => &["rb", "rake", "gemspec"],
+            Language::Prolog => &["pl", "plt", "pro", "prolog"],
         }
     }
 
@@ -64,6 +68,7 @@ impl Language {
             Language::Go => "go",
             Language::Elixir => "elixir",
             Language::Ruby => "ruby",
+            Language::Prolog => "prolog",
         }
     }
 }
@@ -78,6 +83,7 @@ pub struct Parser {
     go_parser: TSParser,
     elixir_parser: TSParser,
     ruby_parser: TSParser,
+    prolog_parser: TSParser,
 }
 
 impl Parser {
@@ -123,6 +129,11 @@ impl Parser {
             .set_language(&tree_sitter_ruby::LANGUAGE.into())
             .map_err(|e| Error::Parse(format!("Failed to set Ruby language: {}", e)))?;
 
+        let mut prolog_parser = TSParser::new();
+        prolog_parser
+            .set_language(&tree_sitter_prolog::LANGUAGE.into())
+            .map_err(|e| Error::Parse(format!("Failed to set Prolog language: {}", e)))?;
+
         Ok(Self {
             rust_parser,
             python_parser,
@@ -132,6 +143,7 @@ impl Parser {
             go_parser,
             elixir_parser,
             ruby_parser,
+            prolog_parser,
         })
     }
 
@@ -146,6 +158,7 @@ impl Parser {
             Language::Go => &mut self.go_parser,
             Language::Elixir => &mut self.elixir_parser,
             Language::Ruby => &mut self.ruby_parser,
+            Language::Prolog => &mut self.prolog_parser,
         };
 
         parser
@@ -235,6 +248,22 @@ mod tests {
         let tree = parser.parse(code, Language::Ruby);
         assert!(tree.is_ok());
         assert!(!tree.unwrap().root_node().has_error());
+    }
+
+    #[test]
+    fn test_parse_prolog() {
+        let mut parser = Parser::new().unwrap();
+        let code = "room_connected(A, B) :- relation(A, connects_to, B).";
+        let tree = parser.parse(code, Language::Prolog);
+        assert!(tree.is_ok());
+        assert!(!tree.unwrap().root_node().has_error());
+    }
+
+    #[test]
+    fn test_language_prolog_from_extension() {
+        assert_eq!(Language::from_extension("pl"), Some(Language::Prolog));
+        assert_eq!(Language::from_extension("plt"), Some(Language::Prolog));
+        assert_eq!(Language::from_extension("prolog"), Some(Language::Prolog));
     }
 
     #[test]

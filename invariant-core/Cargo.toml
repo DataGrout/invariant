@@ -25,6 +25,7 @@ tree-sitter-javascript.workspace = true
 tree-sitter-go.workspace = true
 tree-sitter-elixir.workspace = true
 tree-sitter-ruby.workspace = true
+tree-sitter-prolog.workspace = true
 
 # Serialization
 serde.workspace = true

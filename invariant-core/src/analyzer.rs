@@ -59,6 +59,7 @@ impl Analyzer {
             Language::Go => analyze_go(&root, ctx)?,
             Language::Elixir => analyze_elixir(&root, ctx)?,
             Language::Ruby => analyze_ruby(&root, ctx)?,
+            Language::Prolog => analyze_prolog(&root, ctx)?,
         }
 
         summary.loc = code.lines().count();
@@ -1132,6 +1133,364 @@ fn analyze_ruby_calls(
 }
 
 // ========================================================================
+// Prolog Analysis
+// ========================================================================
+//
+// Prolog's structure maps onto the same fact vocabulary as the imperative
+// languages, with a couple of language-specific twists:
+//   - a *predicate* (name/arity) is the unit, and it is defined by one OR MANY
+//     clauses — so we emit one `function` fact per predicate (first clause) and
+//     an extra `function_line` per additional clause;
+//   - `function_param` comes from the representative clause's head arguments;
+//   - `calls_external` comes from the goals in a clause body (we recurse only
+//     through the control operators `, ; -> *-> |`, and treat each goal's
+//     functor — including infix goals like `=`/`is` — as the callee);
+//   - `:- module(Name, Exports)` drives visibility (exported ⇒ public), and
+//     `:- use_module(...)` becomes a `depends_on` dependency.
+
+/// Body/control operators we recurse THROUGH to reach individual goals.
+const PROLOG_CONTROL_OPS: &[&str] = &[",", ";", "|", "->", "*->"];
+
+fn analyze_prolog(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let (module_id, module_name) = module_id_from_path(ctx.filepath, ".pl", ":");
+    emit_module(ctx, &module_id, &module_name, ctx.filepath, 1);
+
+    // Pass 1: directives — collect exported predicate ids + module deps.
+    let mut exported: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut has_module = false;
+    let mut cursor = root.walk();
+    let clauses: Vec<Node<'_>> = root
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "clause")
+        .collect();
+
+    for clause in &clauses {
+        let Some(term) = clause.child_by_field_name("term") else {
+            continue;
+        };
+        if term.kind() == "unary_operation" {
+            let op = field_op_text(&term, ctx.code);
+            if op == ":-" || op == "?-" {
+                if let Some(operand) = term.child_by_field_name("operand") {
+                    prolog_directive(&operand, &module_id, &mut exported, &mut has_module, ctx);
+                }
+            }
+        }
+    }
+
+    // Pass 2: clauses → predicates (deduped by name/arity), params, calls.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for clause in &clauses {
+        let Some(term) = clause.child_by_field_name("term") else {
+            continue;
+        };
+
+        // Skip directives — they are not predicate definitions.
+        if term.kind() == "unary_operation" {
+            let op = field_op_text(&term, ctx.code);
+            if op == ":-" || op == "?-" {
+                continue;
+            }
+        }
+
+        let (head, body) = prolog_head_body(&term);
+        let Some(head) = head else { continue };
+        let Some((name, arity, head_node)) = prolog_predicate(&head, ctx.code) else {
+            continue;
+        };
+
+        let func_id = normalize_id(&format!("{}_{}", name, arity));
+        let line = node_line(clause);
+
+        if seen.insert(func_id.clone()) {
+            let visibility = if !has_module || exported.contains(&func_id) {
+                "public"
+            } else {
+                "private"
+            };
+            emit_prolog_predicate(
+                ctx, &func_id, &module_id, &name, arity, visibility, line, &head_node,
+            );
+        } else {
+            // Another clause of an already-seen predicate — record its line.
+            ctx.facts.push(Fact::new(
+                "function_line",
+                vec![
+                    FactValue::String(func_id.clone()),
+                    FactValue::Integer(line as i64),
+                ],
+            ));
+        }
+
+        if let Some(body) = body {
+            prolog_collect_goals(&body, ctx.code, &func_id, ctx);
+        }
+    }
+
+    Ok(())
+}
+
+/// The text of a node's `operator` field (e.g. `":-"`, `","`, `"is"`), or "".
+fn field_op_text(node: &Node<'_>, code: &[u8]) -> String {
+    node.child_by_field_name("operator")
+        .map(|n| node_text(&n, code).to_string())
+        .unwrap_or_default()
+}
+
+/// The name of an `atom` node, with surrounding single-quotes stripped for
+/// quoted atoms (`'$foo'` → `$foo`).
+fn prolog_atom_name(node: &Node<'_>, code: &[u8]) -> String {
+    let t = node_text(node, code);
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        t[1..t.len() - 1].to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Split a clause term into its (head, optional body).
+fn prolog_head_body<'a>(term: &Node<'a>) -> (Option<Node<'a>>, Option<Node<'a>>) {
+    if term.kind() == "binary_operation" {
+        let op = term.child_by_field_name("operator");
+        let op_kind = op.map(|n| n.kind());
+        match op_kind {
+            // Rule / DCG: Head :- Body  /  Head --> Body
+            Some(":-") | Some("-->") => {
+                return (
+                    term.child_by_field_name("left"),
+                    term.child_by_field_name("right"),
+                );
+            }
+            // ProbLog annotated fact: Prob :: Head
+            Some("::") => {
+                return (term.child_by_field_name("right"), None);
+            }
+            _ => {}
+        }
+    }
+    (Some(*term), None)
+}
+
+/// Resolve a head term to `(name, arity, head_node)`. Unwraps a leading ProbLog
+/// `::` annotation (`0.5::heads :- ...` → head predicate is `heads`).
+fn prolog_predicate<'a>(head: &Node<'a>, code: &[u8]) -> Option<(String, usize, Node<'a>)> {
+    let mut h = *head;
+    if h.kind() == "binary_operation"
+        && h.child_by_field_name("operator").map(|n| n.kind()) == Some("::")
+    {
+        if let Some(r) = h.child_by_field_name("right") {
+            h = r;
+        }
+    }
+
+    match h.kind() {
+        "compound_term" => {
+            let functor = h.child_by_field_name("functor")?;
+            let name = prolog_atom_name(&functor, code);
+            let mut cursor = h.walk();
+            let arity = h.children_by_field_name("argument", &mut cursor).count();
+            Some((name, arity, h))
+        }
+        "atom" => Some((prolog_atom_name(&h, code), 0, h)),
+        "operator_atom" => Some((node_text(&h, code).to_string(), 0, h)),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_prolog_predicate(
+    ctx: &mut Ctx<'_>,
+    func_id: &str,
+    module_id: &str,
+    name: &str,
+    arity: usize,
+    visibility: &str,
+    line: usize,
+    head_node: &Node<'_>,
+) {
+    ctx.facts.push(Fact::new(
+        "function",
+        vec![
+            FactValue::String(func_id.to_string()),
+            FactValue::String(module_id.to_string()),
+            FactValue::String(name.to_string()),
+            FactValue::Integer(arity as i64),
+            FactValue::Atom(visibility.to_string()),
+            FactValue::Integer(line as i64),
+            FactValue::String(ctx.commit_sha.to_string()),
+        ],
+    ));
+    ctx.facts.push(Fact::new(
+        "function_line",
+        vec![
+            FactValue::String(func_id.to_string()),
+            FactValue::Integer(line as i64),
+        ],
+    ));
+    ctx.facts.push(Fact::new(
+        "function_visibility",
+        vec![
+            FactValue::String(func_id.to_string()),
+            FactValue::Atom(visibility.to_string()),
+        ],
+    ));
+
+    // Params from head arguments — positional, untyped (Prolog is untyped).
+    let mut cursor = head_node.walk();
+    let mut pos: i64 = 0;
+    for arg in head_node.children_by_field_name("argument", &mut cursor) {
+        let pname = clean_param(node_text(&arg, ctx.code));
+        if pname.is_empty() {
+            continue;
+        }
+        ctx.facts.push(Fact::new(
+            "function_param",
+            vec![
+                FactValue::String(func_id.to_string()),
+                FactValue::Integer(pos),
+                FactValue::String(pname),
+                FactValue::Atom("unknown".to_string()),
+            ],
+        ));
+        pos += 1;
+    }
+
+    ctx.summary.functions += 1;
+}
+
+/// Walk a clause body, recursing only through control operators, and emit a
+/// call for each goal's functor (including infix goals like `=`/`is`).
+fn prolog_collect_goals(node: &Node<'_>, code: &[u8], caller_id: &str, ctx: &mut Ctx<'_>) {
+    match node.kind() {
+        "binary_operation" => {
+            let op = field_op_text(node, code);
+            if PROLOG_CONTROL_OPS.contains(&op.as_str()) {
+                if let Some(l) = node.child_by_field_name("left") {
+                    prolog_collect_goals(&l, code, caller_id, ctx);
+                }
+                if let Some(r) = node.child_by_field_name("right") {
+                    prolog_collect_goals(&r, code, caller_id, ctx);
+                }
+            } else if op == ":" {
+                // Module-qualified goal `Mod:Goal` — the real callee is the goal
+                // on the right; the module qualifier is not itself a call.
+                if let Some(r) = node.child_by_field_name("right") {
+                    prolog_collect_goals(&r, code, caller_id, ctx);
+                }
+            } else if !op.is_empty() {
+                emit_call(ctx, caller_id, &op, node_line(node));
+            }
+        }
+        "unary_operation" => {
+            let op = field_op_text(node, code);
+            if op == "\\+" {
+                if let Some(o) = node.child_by_field_name("operand") {
+                    prolog_collect_goals(&o, code, caller_id, ctx);
+                }
+            } else if !op.is_empty() {
+                emit_call(ctx, caller_id, &op, node_line(node));
+            }
+        }
+        "parenthesized" | "curly_block" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                prolog_collect_goals(&child, code, caller_id, ctx);
+            }
+        }
+        "compound_term" => {
+            if let Some(functor) = node.child_by_field_name("functor") {
+                let name = prolog_atom_name(&functor, code);
+                if !name.is_empty() {
+                    emit_call(ctx, caller_id, &name, node_line(node));
+                }
+            }
+        }
+        "atom" => {
+            let name = prolog_atom_name(node, code);
+            if !name.is_empty() {
+                emit_call(ctx, caller_id, &name, node_line(node));
+            }
+        }
+        "cut" => emit_call(ctx, caller_id, "!", node_line(node)),
+        _ => {}
+    }
+}
+
+/// Handle a directive's operand (the goal after `:-`).
+fn prolog_directive(
+    operand: &Node<'_>,
+    module_id: &str,
+    exported: &mut std::collections::HashSet<String>,
+    has_module: &mut bool,
+    ctx: &mut Ctx<'_>,
+) {
+    if operand.kind() != "compound_term" {
+        return;
+    }
+    let Some(functor) = operand.child_by_field_name("functor") else {
+        return;
+    };
+    let dname = prolog_atom_name(&functor, ctx.code);
+
+    let mut cursor = operand.walk();
+    let args: Vec<Node<'_>> = operand
+        .children_by_field_name("argument", &mut cursor)
+        .collect();
+
+    match dname.as_str() {
+        "module" => {
+            *has_module = true;
+            if let Some(list) = args.get(1) {
+                if list.kind() == "list" {
+                    let mut lc = list.walk();
+                    for el in list.children_by_field_name("element", &mut lc) {
+                        // Each export is `name/arity`.
+                        if el.kind() == "binary_operation" && field_op_text(&el, ctx.code) == "/" {
+                            let (Some(l), Some(r)) = (
+                                el.child_by_field_name("left"),
+                                el.child_by_field_name("right"),
+                            ) else {
+                                continue;
+                            };
+                            let lname = prolog_atom_name(&l, ctx.code);
+                            let ar = node_text(&r, ctx.code);
+                            exported.insert(normalize_id(&format!("{}_{}", lname, ar)));
+                        }
+                    }
+                }
+            }
+        }
+        "use_module" | "ensure_loaded" | "consult" => {
+            if let Some(arg) = args.first() {
+                let dep = prolog_dep_name(arg, ctx.code);
+                if !dep.is_empty() {
+                    emit_dependency(ctx, module_id, &dep, &dname, node_line(operand));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A dependency target: unwrap `library(lists)` → `lists`, otherwise the
+/// stripped atom/string text.
+fn prolog_dep_name(arg: &Node<'_>, code: &[u8]) -> String {
+    if arg.kind() == "compound_term" {
+        if let Some(functor) = arg.child_by_field_name("functor") {
+            if prolog_atom_name(&functor, code) == "library" {
+                let mut cursor = arg.walk();
+                let inner = arg.children_by_field_name("argument", &mut cursor).next();
+                if let Some(inner) = inner {
+                    return prolog_atom_name(&inner, code);
+                }
+            }
+        }
+    }
+    let t = node_text(arg, code);
+    t.trim_matches(|c| c == '\'' || c == '"').to_string()
+}
+
+// ========================================================================
 // Shared call analysis (Python uses "call", Rust/JS/Go use "call_expression")
 // ========================================================================
 
@@ -1422,6 +1781,229 @@ pub fn run(&self) -> bool {
         assert!(
             joined.contains("unknown"),
             "untyped params should be unknown: {joined}"
+        );
+    }
+
+    #[test]
+    fn prolog_predicates_params_calls_and_visibility() {
+        let mut analyzer = Analyzer::new().unwrap();
+        let code = r#":- module(dungeon, [room_accessible/2]).
+:- use_module(library(lists)).
+
+relation(entrance, connects_to, hall).
+relation(hall, connects_to, vault).
+
+room_accessible(P, R) :-
+    attribute(R, requires_key, K),
+    relation(P, has_item, K).
+
+room_accessible(P, R) :- relation(P, in_room, R).
+"#;
+        let result = analyzer
+            .lens_code(code, Language::Prolog, "dungeon.pl", "abc123")
+            .unwrap();
+        let facts = result.facts.join("\n");
+
+        // Predicate emitted once per name/arity (room_accessible/2 has 2 clauses
+        // but a single `function` fact).
+        let funcs: Vec<&String> = result
+            .facts
+            .iter()
+            .filter(|f| f.starts_with("function('room_accessible_2'"))
+            .collect();
+        assert_eq!(funcs.len(), 1, "predicate should be deduped: {funcs:?}");
+
+        // Exported predicate is public; non-exported is private.
+        assert!(
+            facts.contains("function('room_accessible_2', 'dungeon', 'room_accessible', 2, public"),
+            "exported pred should be public: {facts}"
+        );
+        assert!(
+            facts.contains("function('relation_3', 'dungeon', 'relation', 3, private"),
+            "non-exported pred should be private: {facts}"
+        );
+
+        // Head variables become positional params.
+        assert!(
+            facts.contains("function_param('room_accessible_2', 0, 'P', unknown)"),
+            "param P missing: {facts}"
+        );
+        assert!(
+            facts.contains("function_param('room_accessible_2', 1, 'R', unknown)"),
+            "param R missing: {facts}"
+        );
+
+        // Body goals become calls (functor of each goal).
+        assert!(
+            facts.contains("calls_external('room_accessible_2', 'unknown', 'attribute'"),
+            "attribute call missing: {facts}"
+        );
+        assert!(
+            facts.contains("calls_external('room_accessible_2', 'unknown', 'relation'"),
+            "relation call missing: {facts}"
+        );
+
+        // The second clause adds an extra function_line for the same predicate.
+        let lines = result
+            .facts
+            .iter()
+            .filter(|f| f.starts_with("function_line('room_accessible_2'"))
+            .count();
+        assert_eq!(lines, 2, "expected a line per clause: {facts}");
+
+        // use_module → dependency.
+        assert!(
+            facts.contains("depends_on('dungeon', 'lists', use_module"),
+            "use_module dep missing: {facts}"
+        );
+    }
+
+    #[test]
+    fn prolog_problog_annotation_resolves_head_predicate() {
+        let mut analyzer = Analyzer::new().unwrap();
+        let code = "0.5::heads :- toss.\n0.3::rains.\n";
+        let result = analyzer
+            .lens_code(code, Language::Prolog, "coin.pl", "z")
+            .unwrap();
+        let facts = result.facts.join("\n");
+        // No module directive → predicates default public.
+        assert!(
+            facts.contains("function('heads_0', 'coin', 'heads', 0, public"),
+            "problog head 'heads' missing: {facts}"
+        );
+        assert!(
+            facts.contains("function('rains_0', 'coin', 'rains', 0, public"),
+            "problog fact 'rains' missing: {facts}"
+        );
+        // The annotated rule's body goal is a call.
+        assert!(
+            facts.contains("calls_external('heads_0', 'unknown', 'toss'"),
+            "toss call missing: {facts}"
+        );
+    }
+
+    /// Helper: lens a Prolog snippet and join the facts for substring asserts.
+    fn prolog_facts(code: &str) -> String {
+        Analyzer::new()
+            .unwrap()
+            .lens_code(code, Language::Prolog, "m.pl", "sha")
+            .unwrap()
+            .facts
+            .join("\n")
+    }
+
+    #[test]
+    fn prolog_fact_predicate_and_params_from_first_clause() {
+        // A fact predicate gets arity + positional params from the head args.
+        let f = prolog_facts("relation(entrance, connects_to, hall).\n");
+        assert!(
+            f.contains("function('relation_3', 'm', 'relation', 3, public"),
+            "relation/3 fact pred missing: {f}"
+        );
+        assert!(
+            f.contains("function_param('relation_3', 0,"),
+            "positional param 0 missing: {f}"
+        );
+        assert!(
+            f.contains("function_param('relation_3', 2,"),
+            "positional param 2 missing: {f}"
+        );
+    }
+
+    #[test]
+    fn prolog_negation_records_inner_goal_call() {
+        let f = prolog_facts("safe(X) :- \\+ forbidden(X).\n");
+        assert!(
+            f.contains("calls_external('safe_1', 'unknown', 'forbidden'"),
+            "negated inner goal should be a call: {f}"
+        );
+    }
+
+    #[test]
+    fn prolog_if_then_else_records_all_branch_calls() {
+        let f = prolog_facts("pick(X) :- ( cond(X) -> yes(X) ; no(X) ).\n");
+        for goal in ["cond", "yes", "no"] {
+            assert!(
+                f.contains(&format!("calls_external('pick_1', 'unknown', '{goal}'")),
+                "branch goal {goal} missing: {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn prolog_module_qualified_goal_calls_inner_predicate() {
+        // `lists:member(...)` — the callee is `member`, not the `:` qualifier.
+        let f = prolog_facts("has(X, L) :- lists:member(X, L).\n");
+        assert!(
+            f.contains("calls_external('has_2', 'unknown', 'member'"),
+            "module-qualified callee should be 'member': {f}"
+        );
+        assert!(
+            !f.contains("'unknown', ':'"),
+            "the ':' qualifier must not be recorded as a call: {f}"
+        );
+    }
+
+    #[test]
+    fn prolog_directives_are_not_predicates() {
+        // dynamic / discontiguous directives must not produce `function` facts.
+        let f = prolog_facts(":- dynamic counter/1.\n:- discontiguous foo/2.\ncounter(0).\n");
+        assert!(
+            !f.contains("function('dynamic_"),
+            "dynamic directive leaked as predicate: {f}"
+        );
+        assert!(
+            !f.contains("function('discontiguous_"),
+            "discontiguous directive leaked as predicate: {f}"
+        );
+        // The actual predicate is still picked up.
+        assert!(
+            f.contains("function('counter_1'"),
+            "counter/1 predicate missing: {f}"
+        );
+    }
+
+    #[test]
+    fn prolog_quoted_atom_predicate_name_is_unquoted() {
+        let f = prolog_facts("'$secret'(X) :- p(X).\n");
+        assert!(
+            f.contains("function('_secret_1', 'm', '$secret', 1"),
+            "quoted atom name should be unquoted in name slot: {f}"
+        );
+    }
+
+    #[test]
+    fn prolog_cut_and_infix_goals_are_calls() {
+        let f = prolog_facts("g(X, Y) :- p(X), !, Y is X + 1.\n");
+        assert!(
+            f.contains("calls_external('g_2', 'unknown', 'p'"),
+            "p call missing: {f}"
+        );
+        assert!(
+            f.contains("calls_external('g_2', 'unknown', '!'"),
+            "cut should be recorded as a goal: {f}"
+        );
+        assert!(
+            f.contains("calls_external('g_2', 'unknown', 'is'"),
+            "infix `is` goal should be a call: {f}"
+        );
+    }
+
+    #[test]
+    fn prolog_dcg_head_becomes_predicate() {
+        let f = prolog_facts("greeting --> [hello], [world].\n");
+        assert!(
+            f.contains("function('greeting_0', 'm', 'greeting', 0"),
+            "DCG head predicate missing: {f}"
+        );
+    }
+
+    #[test]
+    fn prolog_bare_path_dependency() {
+        let f = prolog_facts(":- use_module('utils/helpers.pl').\n");
+        assert!(
+            f.contains("depends_on('m', 'utils/helpers.pl', use_module"),
+            "bare-path use_module dep missing: {f}"
         );
     }
 

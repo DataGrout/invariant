@@ -68,7 +68,7 @@ After the first `invariant init`, Invariant prefers a persisted mTLS identity in
 └───────────────────────────────────────┘
 ```
 
-Invariant performs fast, local structural extraction using tree-sitter. It understands Python, Rust, TypeScript, TSX, JavaScript, Go, Elixir, and Ruby ASTs natively. Facts are uploaded to DataGrout Invariant via the Conduit SDK for server-side semantic enrichment — LLM-powered intent classification, security analysis, and consequence reasoning.
+Invariant performs fast, local structural extraction using tree-sitter. It understands Python, Rust, TypeScript, TSX, JavaScript, Go, Elixir, Ruby, and Prolog ASTs natively. Facts are uploaded to DataGrout Invariant via the Conduit SDK for server-side semantic enrichment — LLM-powered intent classification, security analysis, and consequence reasoning.
 
 ## Installation
 
@@ -177,6 +177,7 @@ Show connection, identity, and configuration status.
 | Go         | tree-sitter| `.go`            |
 | Elixir     | tree-sitter| `.ex`, `.exs`    |
 | Ruby       | tree-sitter| `.rb`, `.rake`, `.gemspec` |
+| Prolog     | tree-sitter| `.pl`, `.plt`, `.pro`, `.prolog` |
 
 ## Architecture
 
