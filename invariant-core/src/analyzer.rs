@@ -354,7 +354,9 @@ fn analyze_python_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) 
         "public"
     };
 
-    emit_function(ctx, &func_id, module_id, func_name, arity, visibility, line, node);
+    emit_function(
+        ctx, &func_id, module_id, func_name, arity, visibility, line, node,
+    );
 
     if let Some(body) = node.child_by_field_name("body") {
         analyze_calls(&body, ctx.code, &func_id, ctx, "call")?;
@@ -463,7 +465,9 @@ fn analyze_rust_function(
         "private"
     };
 
-    emit_function(ctx, &func_id, module_id, func_name, arity, visibility, line, node);
+    emit_function(
+        ctx, &func_id, module_id, func_name, arity, visibility, line, node,
+    );
 
     if let Some(body) = node.child_by_field_name("body") {
         analyze_calls(&body, ctx.code, &func_id, ctx, "call_expression")?;
@@ -682,7 +686,9 @@ fn analyze_go_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
         "private"
     };
 
-    emit_function(ctx, &func_id, module_id, &name, arity, visibility, line, node);
+    emit_function(
+        ctx, &func_id, module_id, &name, arity, visibility, line, node,
+    );
 
     if let Some(body) = node.child_by_field_name("body") {
         analyze_calls(&body, ctx.code, &func_id, ctx, "call_expression")?;
@@ -1049,7 +1055,9 @@ fn analyze_ruby_method(
     let func_id = normalize_id(&format!("{}_{}", name, arity));
     let line = node_line(node);
 
-    emit_function(ctx, &func_id, module_id, &name, arity, visibility, line, node);
+    emit_function(
+        ctx, &func_id, module_id, &name, arity, visibility, line, node,
+    );
 
     if let Some(body) = node.child_by_field_name("body") {
         analyze_ruby_calls(&body, ctx.code, &func_id, ctx)?;
@@ -1218,10 +1226,7 @@ fn sanitize_callee(text: &str) -> String {
     // Take the part before the first `(`, then the final `.`/`::`-segment.
     let head = text.split('(').next().unwrap_or(text);
     let head = head.replace(['\n', '\r', '\t', ' '], "");
-    head.rsplit(['.'])
-        .next()
-        .unwrap_or(&head)
-        .to_string()
+    head.rsplit(['.']).next().unwrap_or(&head).to_string()
 }
 
 #[cfg(test)]
@@ -1235,7 +1240,10 @@ mod tests {
         // path handles real chains; this is only the catch-all fallback).
         let garbage = "Self::git_output(&[\"tag\", \"-l\"], &self.path)\n            .map";
         let out = sanitize_callee(garbage);
-        assert!(!out.contains('\n') && !out.contains('(') && !out.contains(' '), "not clean: {out:?}");
+        assert!(
+            !out.contains('\n') && !out.contains('(') && !out.contains(' '),
+            "not clean: {out:?}"
+        );
         assert!(!out.is_empty());
 
         // Clean names pass through untouched.
@@ -1278,7 +1286,10 @@ pub fn run(&self) -> bool {
 
         // The chain's method names are captured individually.
         let joined = calls.iter().fold(String::new(), |a, f| a + f);
-        assert!(joined.contains("git_output"), "missing git_output: {joined}");
+        assert!(
+            joined.contains("git_output"),
+            "missing git_output: {joined}"
+        );
         assert!(joined.contains("map"), "missing map: {joined}");
         assert!(joined.contains("unwrap_or"), "missing unwrap_or: {joined}");
         assert!(joined.contains("helper"), "missing helper: {joined}");
@@ -1322,7 +1333,10 @@ pub fn run(&self) -> bool {
             .filter(|f| f.starts_with("function_param("))
             .fold(String::new(), |a, f| a + f);
         assert!(joined.contains("'self'"), "self receiver missing: {joined}");
-        assert!(joined.contains("'n'") && joined.contains("'u8'"), "typed param missing: {joined}");
+        assert!(
+            joined.contains("'n'") && joined.contains("'u8'"),
+            "typed param missing: {joined}"
+        );
     }
 
     #[test]
@@ -1340,7 +1354,12 @@ pub fn run(&self) -> bool {
         };
 
         // JavaScript — names, untyped → unknown.
-        let js = params(&mut analyzer, "function f(a, b) { return a; }", Language::JavaScript, "x.js");
+        let js = params(
+            &mut analyzer,
+            "function f(a, b) { return a; }",
+            Language::JavaScript,
+            "x.js",
+        );
         assert!(js.contains("'a'") && js.contains("'b'"), "js: {js}");
         assert!(js.contains("unknown"), "js untyped should be unknown: {js}");
 
@@ -1351,16 +1370,35 @@ pub fn run(&self) -> bool {
             Language::TypeScript,
             "x.ts",
         );
-        assert!(ts.contains("'number'"), "ts type should be bare 'number': {ts}");
-        assert!(ts.contains("'string'"), "ts type should be bare 'string': {ts}");
-        assert!(!ts.contains(": number"), "ts type must not keep the colon: {ts}");
+        assert!(
+            ts.contains("'number'"),
+            "ts type should be bare 'number': {ts}"
+        );
+        assert!(
+            ts.contains("'string'"),
+            "ts type should be bare 'string': {ts}"
+        );
+        assert!(
+            !ts.contains(": number"),
+            "ts type must not keep the colon: {ts}"
+        );
 
         // Go — typed params.
-        let go = params(&mut analyzer, "func Add(a int, b int) int { return a }", Language::Go, "x.go");
+        let go = params(
+            &mut analyzer,
+            "func Add(a int, b int) int { return a }",
+            Language::Go,
+            "x.go",
+        );
         assert!(go.contains("'a'") && go.contains("'int'"), "go: {go}");
 
         // Ruby — names, dynamically typed → unknown.
-        let rb = params(&mut analyzer, "def greet(name, count)\n  name\nend\n", Language::Ruby, "x.rb");
+        let rb = params(
+            &mut analyzer,
+            "def greet(name, count)\n  name\nend\n",
+            Language::Ruby,
+            "x.rb",
+        );
         assert!(rb.contains("'name'") && rb.contains("'count'"), "rb: {rb}");
         assert!(rb.contains("unknown"), "rb untyped should be unknown: {rb}");
     }
@@ -1381,7 +1419,10 @@ pub fn run(&self) -> bool {
         assert!(joined.contains("'name'"), "missing name: {joined}");
         assert!(joined.contains("'count'"), "missing count: {joined}");
         // No type annotations → type atom is `unknown` (unquoted atom).
-        assert!(joined.contains("unknown"), "untyped params should be unknown: {joined}");
+        assert!(
+            joined.contains("unknown"),
+            "untyped params should be unknown: {joined}"
+        );
     }
 
     #[test]
