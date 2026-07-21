@@ -6,6 +6,28 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.7.0] - 2026-07-21
+
+### Added
+
+- **PHP support — `Language::Php` + `analyze_php`** — Invariant now lenses PHP source (`.php` / `.phtml`) into the standard fact vocabulary, using the official [`tree-sitter-php`](https://github.com/tree-sitter/tree-sitter-php) grammar in its **HTML-intermixed** variant (`LANGUAGE_PHP`, not `LANGUAGE_PHP_ONLY`), so WordPress-style template files — HTML with `<?php ?>` islands — lens as well as pure class files. Mapping:
+  - **standalone functions** and **class methods** both emit `function` facts; method **visibility** comes from the `visibility_modifier` child (`public` / `private` / `protected`), defaulting to `public` when unmodified, per PHP semantics;
+  - **classes / interfaces / traits / enums** emit `module` facts (labelled `class:Name`, `interface:Name`, …) and scope their methods, mirroring the Ruby class handling; `extends` / `implements` / trait-`use` emit `depends_on`;
+  - a file-level `namespace Foo;` (no body) **re-scopes** the remaining siblings; `namespace Foo { ... }` scopes its body;
+  - `use Foo\Bar;` and grouped `use Foo\{A, B};` (namespace_use_declaration) plus `include` / `include_once` / `require` / `require_once` with literal paths emit `depends_on`;
+  - **calls** come from `function_call_expression` (plain / qualified name — dynamic `$callback()` calls are skipped), `member_call_expression` / `nullsafe_member_call_expression` (method name), `scoped_call_expression` (emitted as `Scope::name`), and `object_creation_expression` (constructor → class name);
+  - **parameters** flow through the shared extractor with their `$names` and declared types (`formal_parameters` was already in `find_params_node`).
+  - Module names use `::` separators (not PHP's `\`) so downstream suffix-on-separator name matching (e.g. manifold-nav's `nav_callee_name_matches`, which recognises `.` and `:`) works unchanged.
+- **PHP tests** — `test_analyze_php_simple` (visibility incl. default-public, `$this->` / static / constructor / plain calls, use + require deps, `$param` facts), `test_analyze_php_html_template` (WordPress-style HTML+PHP file), and `test_analyze_php_namespace_and_traits` (file-level namespace re-scope, interface/trait modules, grouped use-imports) in `analyzer.rs`; `test_parse_php` / `test_parse_php_html_intermixed` / `test_language_php_from_extension` in `parser.rs`.
+
+### Notes
+
+- Pinned `tree-sitter-php = "0.23"` (0.23.11): the 0.24.x grammar line is generated with language ABI 15, which the workspace's `tree-sitter 0.24` runtime rejects (max ABI 14). 0.23 matches the ABI and the vintage of the other grammar crates.
+- Anonymous functions and arrow functions are intentionally not emitted as `function` facts; calls inside them attribute to the enclosing named function (the common WordPress `add_action('init', function () { ... })` shape).
+- DataGrout's `invariant.code_lens@1` tool accepts `language: "php"` in the same release (DG-side chunked-LLM lens path; the two lens paths stay in step).
+
+---
+
 ## [0.6.0] - 2026-05-27
 
 ### Added

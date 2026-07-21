@@ -22,6 +22,8 @@ pub enum Language {
     Elixir,
     /// Ruby
     Ruby,
+    /// PHP (HTML-intermixed grammar, so templates/WordPress files lens too)
+    Php,
     /// Prolog (ISO + SWI + ProbLog superset)
     Prolog,
 }
@@ -38,6 +40,7 @@ impl Language {
             "go" => Some(Language::Go),
             "ex" | "exs" => Some(Language::Elixir),
             "rb" | "rake" | "gemspec" => Some(Language::Ruby),
+            "php" | "phtml" => Some(Language::Php),
             "pl" | "plt" | "pro" | "prolog" => Some(Language::Prolog),
             _ => None,
         }
@@ -54,6 +57,7 @@ impl Language {
             Language::Go => &["go"],
             Language::Elixir => &["ex", "exs"],
             Language::Ruby => &["rb", "rake", "gemspec"],
+            Language::Php => &["php", "phtml"],
             Language::Prolog => &["pl", "plt", "pro", "prolog"],
         }
     }
@@ -68,6 +72,7 @@ impl Language {
             Language::Go => "go",
             Language::Elixir => "elixir",
             Language::Ruby => "ruby",
+            Language::Php => "php",
             Language::Prolog => "prolog",
         }
     }
@@ -83,6 +88,7 @@ pub struct Parser {
     go_parser: TSParser,
     elixir_parser: TSParser,
     ruby_parser: TSParser,
+    php_parser: TSParser,
     prolog_parser: TSParser,
 }
 
@@ -129,6 +135,11 @@ impl Parser {
             .set_language(&tree_sitter_ruby::LANGUAGE.into())
             .map_err(|e| Error::Parse(format!("Failed to set Ruby language: {}", e)))?;
 
+        let mut php_parser = TSParser::new();
+        php_parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .map_err(|e| Error::Parse(format!("Failed to set PHP language: {}", e)))?;
+
         let mut prolog_parser = TSParser::new();
         prolog_parser
             .set_language(&tree_sitter_prolog::LANGUAGE.into())
@@ -143,6 +154,7 @@ impl Parser {
             go_parser,
             elixir_parser,
             ruby_parser,
+            php_parser,
             prolog_parser,
         })
     }
@@ -158,6 +170,7 @@ impl Parser {
             Language::Go => &mut self.go_parser,
             Language::Elixir => &mut self.elixir_parser,
             Language::Ruby => &mut self.ruby_parser,
+            Language::Php => &mut self.php_parser,
             Language::Prolog => &mut self.prolog_parser,
         };
 
@@ -271,5 +284,29 @@ mod tests {
         assert_eq!(Language::from_extension("rb"), Some(Language::Ruby));
         assert_eq!(Language::from_extension("rake"), Some(Language::Ruby));
         assert_eq!(Language::from_extension("gemspec"), Some(Language::Ruby));
+    }
+
+    #[test]
+    fn test_language_php_from_extension() {
+        assert_eq!(Language::from_extension("php"), Some(Language::Php));
+        assert_eq!(Language::from_extension("phtml"), Some(Language::Php));
+    }
+
+    #[test]
+    fn test_parse_php() {
+        let mut parser = Parser::new().unwrap();
+        let code = "<?php\nfunction greet($name) {\n    return \"Hello $name\";\n}\n";
+        let tree = parser.parse(code, Language::Php);
+        assert!(tree.is_ok());
+        assert!(!tree.unwrap().root_node().has_error());
+    }
+
+    #[test]
+    fn test_parse_php_html_intermixed() {
+        let mut parser = Parser::new().unwrap();
+        let code = "<html><body><?php echo wp_title(); ?></body></html>";
+        let tree = parser.parse(code, Language::Php);
+        assert!(tree.is_ok());
+        assert!(!tree.unwrap().root_node().has_error());
     }
 }

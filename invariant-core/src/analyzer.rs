@@ -59,6 +59,7 @@ impl Analyzer {
             Language::Go => analyze_go(&root, ctx)?,
             Language::Elixir => analyze_elixir(&root, ctx)?,
             Language::Ruby => analyze_ruby(&root, ctx)?,
+            Language::Php => analyze_php(&root, ctx)?,
             Language::Prolog => analyze_prolog(&root, ctx)?,
         }
 
@@ -1127,6 +1128,265 @@ fn analyze_ruby_calls(
             }
         }
         analyze_ruby_calls(&child, code, func_id, ctx)?;
+    }
+
+    Ok(())
+}
+
+// ========================================================================
+// PHP Analysis
+// ========================================================================
+//
+// Uses the HTML-intermixed `php` grammar so WordPress-style template files
+// (HTML + `<?php ?>` islands) lens as well as pure-PHP class files.
+//   - `function_definition` and `method_declaration` both emit `function`
+//     facts; method visibility comes from the `visibility_modifier` child
+//     (PHP defaults to public when unmodified);
+//   - classes / interfaces / traits / enums emit `module` facts and scope
+//     their methods, mirroring the Ruby class handling;
+//   - a file-level `namespace Foo;` (no body) switches the module scope for
+//     the remaining siblings; `namespace Foo { ... }` scopes its body;
+//   - `use Foo\Bar;` (namespace_use_declaration) and include/require
+//     expressions emit `depends_on`;
+//   - calls come from `function_call_expression` (plain / qualified name),
+//     `member_call_expression` / `nullsafe_member_call_expression` (method
+//     name), `scoped_call_expression` (`Scope::name`), and
+//     `object_creation_expression` (constructor → class name).
+// Module names use `::` separators (not PHP's `\`) so downstream name
+// matching (e.g. manifold-nav's suffix-on-separator rules) works unchanged.
+
+fn analyze_php(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let (module_id, module_name) = module_id_from_path(ctx.filepath, ".php", "::");
+    emit_module(ctx, &module_id, &module_name, ctx.filepath, 1);
+    analyze_php_body(root, &module_id, ctx)
+}
+
+fn analyze_php_body(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    let mut cursor = node.walk();
+    // `namespace Foo;` without a body re-scopes the rest of the file.
+    let mut current_module = module_id.to_string();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "namespace_definition" => {
+                let ns_name = child
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, ctx.code).to_string())
+                    .unwrap_or_else(|| "global".to_string());
+                let ns_id = normalize_id(&ns_name);
+                emit_module(
+                    ctx,
+                    &ns_id,
+                    &ns_name,
+                    &format!("namespace:{}", ns_name),
+                    node_line(&child),
+                );
+                if let Some(body) = child.child_by_field_name("body") {
+                    analyze_php_body(&body, &ns_id, ctx)?;
+                } else {
+                    current_module = ns_id;
+                }
+            }
+            "class_declaration" | "interface_declaration" | "trait_declaration"
+            | "enum_declaration" => {
+                analyze_php_class(&child, ctx)?;
+            }
+            "function_definition" => {
+                analyze_php_function(&child, &current_module, "public", ctx)?;
+            }
+            "namespace_use_declaration" => {
+                analyze_php_use(&child, &current_module, ctx)?;
+            }
+            "include_expression" | "include_once_expression" | "require_expression"
+            | "require_once_expression" => {
+                analyze_php_include(&child, &current_module, ctx)?;
+            }
+            _ => {
+                analyze_php_body(&child, &current_module, ctx)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn analyze_php_class(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let class_name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(&n, ctx.code).to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let class_id = normalize_id(&class_name);
+    let kind_label = node.kind().trim_end_matches("_declaration");
+    emit_module(
+        ctx,
+        &class_id,
+        &class_name,
+        &format!("{}:{}", kind_label, class_name),
+        node_line(node),
+    );
+
+    // `extends Base` / `implements Iface` → dependencies.
+    if let Some(base) = find_child_by_kind(node, "base_clause") {
+        emit_php_name_deps(&base, &class_id, "extends", ctx);
+    }
+    if let Some(impls) = find_child_by_kind(node, "class_interface_clause") {
+        emit_php_name_deps(&impls, &class_id, "implements", ctx);
+    }
+
+    if let Some(body) = node.child_by_field_name("body") {
+        let mut cursor = body.walk();
+        for member in body.children(&mut cursor) {
+            match member.kind() {
+                "method_declaration" => {
+                    let visibility = php_visibility(&member, ctx.code);
+                    analyze_php_function(&member, &class_id, visibility, ctx)?;
+                }
+                "use_declaration" => {
+                    // Trait use inside a class body.
+                    emit_php_name_deps(&member, &class_id, "use", ctx);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Visibility of a class member from its `visibility_modifier` child;
+/// PHP members default to public when unmodified.
+fn php_visibility<'a>(node: &Node<'_>, code: &'a [u8]) -> &'a str {
+    match find_child_by_kind(node, "visibility_modifier") {
+        Some(m) => match node_text(&m, code) {
+            t @ ("private" | "protected" | "public") => t,
+            _ => "public",
+        },
+        None => "public",
+    }
+}
+
+fn analyze_php_function(
+    node: &Node<'_>,
+    module_id: &str,
+    visibility: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(&n, ctx.code).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let arity = param_count(node, "parameters");
+    let func_id = normalize_id(&format!("{}_{}", name, arity));
+    let line = node_line(node);
+
+    emit_function(
+        ctx, &func_id, module_id, &name, arity, visibility, line, node,
+    );
+
+    if let Some(body) = node.child_by_field_name("body") {
+        analyze_php_calls(&body, &func_id, module_id, ctx)?;
+    }
+
+    Ok(())
+}
+
+/// Emit a `depends_on` for every `name` / `qualified_name` under `node`
+/// (covers base_clause, class_interface_clause, trait use, use-clauses).
+fn emit_php_name_deps(node: &Node<'_>, module_id: &str, kind: &str, ctx: &mut Ctx<'_>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "name" | "qualified_name" => {
+                emit_dependency(
+                    ctx,
+                    module_id,
+                    node_text(&child, ctx.code),
+                    kind,
+                    node_line(&child),
+                );
+            }
+            _ => emit_php_name_deps(&child, module_id, kind, ctx),
+        }
+    }
+}
+
+/// `use Foo\Bar;` / `use Foo\{A, B};` → one dependency per use-clause name.
+fn analyze_php_use(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    emit_php_name_deps(node, module_id, "use", ctx);
+    Ok(())
+}
+
+/// include/require expressions → dependency on the literal path (when the
+/// argument is a string literal; dynamic paths are skipped).
+fn analyze_php_include(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    let kind = node.kind().trim_end_matches("_expression");
+    let text = node_text(node, ctx.code);
+    if let Some(start) = text.find(['"', '\'']) {
+        let remaining = &text[start + 1..];
+        if let Some(end) = remaining.find(['"', '\'']) {
+            emit_dependency(ctx, module_id, &remaining[..end], kind, node_line(node));
+        }
+    }
+    Ok(())
+}
+
+fn analyze_php_calls(
+    node: &Node<'_>,
+    func_id: &str,
+    module_id: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_call_expression" => {
+                if let Some(function) = child.child_by_field_name("function") {
+                    // Skip dynamic calls through variables (`$callback()`).
+                    if matches!(function.kind(), "name" | "qualified_name") {
+                        emit_call(ctx, func_id, node_text(&function, ctx.code), node_line(&child));
+                    }
+                }
+            }
+            "member_call_expression" | "nullsafe_member_call_expression" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    emit_call(ctx, func_id, node_text(&name, ctx.code), node_line(&child));
+                }
+            }
+            "scoped_call_expression" => {
+                let scope = child
+                    .child_by_field_name("scope")
+                    .map(|n| node_text(&n, ctx.code).to_string())
+                    .unwrap_or_default();
+                if let Some(name) = child.child_by_field_name("name") {
+                    let called = if scope.is_empty() {
+                        node_text(&name, ctx.code).to_string()
+                    } else {
+                        format!("{}::{}", scope, node_text(&name, ctx.code))
+                    };
+                    emit_call(ctx, func_id, &called, node_line(&child));
+                }
+            }
+            "object_creation_expression" => {
+                let mut oc_cursor = child.walk();
+                let class_name = child
+                    .named_children(&mut oc_cursor)
+                    .find(|n| matches!(n.kind(), "name" | "qualified_name"))
+                    .map(|n| node_text(&n, ctx.code).to_string());
+                if let Some(class_name) = class_name {
+                    emit_call(ctx, func_id, &class_name, node_line(&child));
+                }
+            }
+            "include_expression" | "include_once_expression" | "require_expression"
+            | "require_once_expression" => {
+                analyze_php_include(&child, module_id, ctx)?;
+                continue;
+            }
+            _ => {}
+        }
+        analyze_php_calls(&child, func_id, module_id, ctx)?;
     }
 
     Ok(())
@@ -2222,6 +2482,226 @@ end
             vis_for("targeted_method").as_deref(),
             Some("private"),
             "targeted_method should be private (via private :method_name)"
+        );
+    }
+
+    #[test]
+    fn test_analyze_php_simple() {
+        let mut analyzer = Analyzer::new().unwrap();
+
+        let code = r#"<?php
+namespace App\Billing;
+
+use App\Support\Logger;
+
+require_once 'vendor/autoload.php';
+
+class InvoiceService
+{
+    public function total(array $items, float $tax_rate)
+    {
+        $sum = array_sum($items);
+        $this->log($sum);
+        Logger::write("total computed");
+        $formatter = new NumberFormatter();
+        return $sum * (1 + $tax_rate);
+    }
+
+    private function log($value)
+    {
+        error_log($value);
+    }
+
+    protected function audit()
+    {
+        return null;
+    }
+
+    public function untouched()
+    {
+        return true;
+    }
+}
+
+function apply_discount($amount, $percent)
+{
+    return $amount - ($amount * $percent / 100);
+}
+"#;
+
+        let result = analyzer
+            .lens_code(code, Language::Php, "app/billing/invoice_service.php", "abc123")
+            .unwrap();
+
+        assert!(
+            result.summary.functions >= 5,
+            "Expected at least 5 functions, got {}",
+            result.summary.functions
+        );
+
+        let has = |needle: &str| result.facts.iter().any(|f| f.contains(needle));
+
+        // Class emitted as a module; methods scoped to it.
+        assert!(has("InvoiceService") || has("invoiceservice"), "Missing class module fact");
+        assert!(has("'total'"), "Missing total method fact");
+        assert!(has("'apply_discount'"), "Missing standalone function fact");
+
+        // Visibility: explicit modifiers + default public.
+        let vis_for = |name: &str| -> Option<&str> {
+            result
+                .facts
+                .iter()
+                .find(|f| f.starts_with("function_visibility(") && f.contains(name))
+                .map(|f| {
+                    if f.contains("private") {
+                        "private"
+                    } else if f.contains("protected") {
+                        "protected"
+                    } else {
+                        "public"
+                    }
+                })
+        };
+        assert_eq!(vis_for("total"), Some("public"), "total should be public");
+        assert_eq!(vis_for("log_1"), Some("private"), "log should be private");
+        assert_eq!(vis_for("audit"), Some("protected"), "audit should be protected");
+        assert_eq!(
+            vis_for("untouched"),
+            Some("public"),
+            "unmodified method should default to public"
+        );
+
+        // Dependencies: use-import, require, extends-free.
+        assert!(
+            result.facts.iter().any(|f| f.contains("depends_on") && f.contains("Logger")),
+            "Missing use-import dependency"
+        );
+        assert!(
+            result
+                .facts
+                .iter()
+                .any(|f| f.contains("depends_on") && f.contains("vendor/autoload.php")),
+            "Missing require_once dependency"
+        );
+
+        // Calls: plain function, method-on-$this, scoped (static), constructor.
+        assert!(has("array_sum"), "Missing plain function call");
+        assert!(
+            result.facts.iter().any(|f| f.contains("calls_external") && f.contains("'log'")),
+            "Missing $this->log method call"
+        );
+        assert!(has("Logger::write"), "Missing scoped static call");
+        assert!(has("NumberFormatter"), "Missing constructor call");
+
+        // Params captured with PHP $names.
+        assert!(
+            result.facts.iter().any(|f| f.contains("function_param") && f.contains("$tax_rate")),
+            "Missing $tax_rate param fact"
+        );
+    }
+
+    #[test]
+    fn test_analyze_php_html_template() {
+        // WordPress-style template: HTML with PHP islands must still lens.
+        let mut analyzer = Analyzer::new().unwrap();
+
+        let code = r#"<html>
+<body>
+<?php
+function render_header($title)
+{
+    echo esc_html($title);
+    get_template_part('nav');
+}
+?>
+<div><?php render_header(wp_title()); ?></div>
+</body>
+</html>
+"#;
+
+        let result = analyzer
+            .lens_code(code, Language::Php, "wp-content/themes/x/header.php", "abc123")
+            .unwrap();
+
+        assert!(
+            result.summary.functions >= 1,
+            "Expected the template function, got {}",
+            result.summary.functions
+        );
+        let has = |needle: &str| result.facts.iter().any(|f| f.contains(needle));
+        assert!(has("'render_header'"), "Missing render_header fact");
+        assert!(has("esc_html"), "Missing esc_html call inside function body");
+    }
+
+    #[test]
+    fn test_analyze_php_namespace_and_traits() {
+        // File-level `namespace Foo;` (no body) re-scopes the rest of the
+        // file; interfaces/traits emit modules; grouped use-imports emit one
+        // dependency per name.
+        let mut analyzer = Analyzer::new().unwrap();
+
+        let code = r#"<?php
+namespace App\Payments;
+
+use App\Support\{Clock, Money};
+
+interface Refundable
+{
+    public function refund($amount);
+}
+
+trait LogsActivity
+{
+    public function log_activity($event)
+    {
+        activity_recorder($event);
+    }
+}
+
+function currency_round($amount)
+{
+    return round($amount, 2);
+}
+"#;
+
+        let result = analyzer
+            .lens_code(code, Language::Php, "app/payments/support.php", "abc123")
+            .unwrap();
+
+        let has = |needle: &str| result.facts.iter().any(|f| f.contains(needle));
+
+        // Namespace emitted as a module.
+        assert!(
+            has("namespace:App\\Payments") || has("app_payments"),
+            "Missing namespace module fact"
+        );
+
+        // Interface + trait emitted as modules, their members as functions.
+        assert!(has("interface:Refundable"), "Missing interface module fact");
+        assert!(has("trait:LogsActivity"), "Missing trait module fact");
+        assert!(has("'refund'"), "Missing interface method fact");
+        assert!(has("'log_activity'"), "Missing trait method fact");
+
+        // A function AFTER the bodiless namespace declaration scopes to it,
+        // not to the path-derived file module.
+        let ns_scoped = result.facts.iter().any(|f| {
+            f.starts_with("function(")
+                && f.contains("'currency_round'")
+                && f.contains("app_payments")
+        });
+        assert!(
+            ns_scoped,
+            "currency_round should be scoped to the app_payments namespace module"
+        );
+
+        // Grouped use-import: one dependency per name.
+        assert!(
+            result.facts.iter().any(|f| f.contains("depends_on") && f.contains("Clock")),
+            "Missing Clock dependency from grouped use"
+        );
+        assert!(
+            result.facts.iter().any(|f| f.contains("depends_on") && f.contains("Money")),
+            "Missing Money dependency from grouped use"
         );
     }
 
