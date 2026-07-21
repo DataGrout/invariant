@@ -1187,7 +1187,9 @@ fn analyze_php_body(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Resu
                     current_module = ns_id;
                 }
             }
-            "class_declaration" | "interface_declaration" | "trait_declaration"
+            "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
             | "enum_declaration" => {
                 analyze_php_class(&child, ctx)?;
             }
@@ -1197,7 +1199,9 @@ fn analyze_php_body(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Resu
             "namespace_use_declaration" => {
                 analyze_php_use(&child, &current_module, ctx)?;
             }
-            "include_expression" | "include_once_expression" | "require_expression"
+            "include_expression"
+            | "include_once_expression"
+            | "require_expression"
             | "require_once_expression" => {
                 analyze_php_include(&child, &current_module, ctx)?;
             }
@@ -1346,7 +1350,12 @@ fn analyze_php_calls(
                 if let Some(function) = child.child_by_field_name("function") {
                     // Skip dynamic calls through variables (`$callback()`).
                     if matches!(function.kind(), "name" | "qualified_name") {
-                        emit_call(ctx, func_id, node_text(&function, ctx.code), node_line(&child));
+                        emit_call(
+                            ctx,
+                            func_id,
+                            node_text(&function, ctx.code),
+                            node_line(&child),
+                        );
                     }
                 }
             }
@@ -1379,7 +1388,9 @@ fn analyze_php_calls(
                     emit_call(ctx, func_id, &class_name, node_line(&child));
                 }
             }
-            "include_expression" | "include_once_expression" | "require_expression"
+            "include_expression"
+            | "include_once_expression"
+            | "require_expression"
             | "require_once_expression" => {
                 analyze_php_include(&child, module_id, ctx)?;
                 continue;
@@ -2530,7 +2541,12 @@ function apply_discount($amount, $percent)
 "#;
 
         let result = analyzer
-            .lens_code(code, Language::Php, "app/billing/invoice_service.php", "abc123")
+            .lens_code(
+                code,
+                Language::Php,
+                "app/billing/invoice_service.php",
+                "abc123",
+            )
             .unwrap();
 
         assert!(
@@ -2542,7 +2558,10 @@ function apply_discount($amount, $percent)
         let has = |needle: &str| result.facts.iter().any(|f| f.contains(needle));
 
         // Class emitted as a module; methods scoped to it.
-        assert!(has("InvoiceService") || has("invoiceservice"), "Missing class module fact");
+        assert!(
+            has("InvoiceService") || has("invoiceservice"),
+            "Missing class module fact"
+        );
         assert!(has("'total'"), "Missing total method fact");
         assert!(has("'apply_discount'"), "Missing standalone function fact");
 
@@ -2564,7 +2583,11 @@ function apply_discount($amount, $percent)
         };
         assert_eq!(vis_for("total"), Some("public"), "total should be public");
         assert_eq!(vis_for("log_1"), Some("private"), "log should be private");
-        assert_eq!(vis_for("audit"), Some("protected"), "audit should be protected");
+        assert_eq!(
+            vis_for("audit"),
+            Some("protected"),
+            "audit should be protected"
+        );
         assert_eq!(
             vis_for("untouched"),
             Some("public"),
@@ -2573,7 +2596,10 @@ function apply_discount($amount, $percent)
 
         // Dependencies: use-import, require, extends-free.
         assert!(
-            result.facts.iter().any(|f| f.contains("depends_on") && f.contains("Logger")),
+            result
+                .facts
+                .iter()
+                .any(|f| f.contains("depends_on") && f.contains("Logger")),
             "Missing use-import dependency"
         );
         assert!(
@@ -2587,7 +2613,10 @@ function apply_discount($amount, $percent)
         // Calls: plain function, method-on-$this, scoped (static), constructor.
         assert!(has("array_sum"), "Missing plain function call");
         assert!(
-            result.facts.iter().any(|f| f.contains("calls_external") && f.contains("'log'")),
+            result
+                .facts
+                .iter()
+                .any(|f| f.contains("calls_external") && f.contains("'log'")),
             "Missing $this->log method call"
         );
         assert!(has("Logger::write"), "Missing scoped static call");
@@ -2595,7 +2624,10 @@ function apply_discount($amount, $percent)
 
         // Params captured with PHP $names.
         assert!(
-            result.facts.iter().any(|f| f.contains("function_param") && f.contains("$tax_rate")),
+            result
+                .facts
+                .iter()
+                .any(|f| f.contains("function_param") && f.contains("$tax_rate")),
             "Missing $tax_rate param fact"
         );
     }
@@ -2620,7 +2652,12 @@ function render_header($title)
 "#;
 
         let result = analyzer
-            .lens_code(code, Language::Php, "wp-content/themes/x/header.php", "abc123")
+            .lens_code(
+                code,
+                Language::Php,
+                "wp-content/themes/x/header.php",
+                "abc123",
+            )
             .unwrap();
 
         assert!(
@@ -2630,7 +2667,10 @@ function render_header($title)
         );
         let has = |needle: &str| result.facts.iter().any(|f| f.contains(needle));
         assert!(has("'render_header'"), "Missing render_header fact");
-        assert!(has("esc_html"), "Missing esc_html call inside function body");
+        assert!(
+            has("esc_html"),
+            "Missing esc_html call inside function body"
+        );
     }
 
     #[test]
@@ -2696,11 +2736,17 @@ function currency_round($amount)
 
         // Grouped use-import: one dependency per name.
         assert!(
-            result.facts.iter().any(|f| f.contains("depends_on") && f.contains("Clock")),
+            result
+                .facts
+                .iter()
+                .any(|f| f.contains("depends_on") && f.contains("Clock")),
             "Missing Clock dependency from grouped use"
         );
         assert!(
-            result.facts.iter().any(|f| f.contains("depends_on") && f.contains("Money")),
+            result
+                .facts
+                .iter()
+                .any(|f| f.contains("depends_on") && f.contains("Money")),
             "Missing Money dependency from grouped use"
         );
     }
