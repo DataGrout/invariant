@@ -34,9 +34,9 @@ impl Language {
         match ext {
             "rs" => Some(Language::Rust),
             "py" | "pyw" => Some(Language::Python),
-            "ts" => Some(Language::TypeScript),
+            "ts" | "mts" | "cts" => Some(Language::TypeScript),
             "tsx" => Some(Language::Tsx),
-            "js" | "jsx" => Some(Language::JavaScript),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
             "go" => Some(Language::Go),
             "ex" | "exs" => Some(Language::Elixir),
             "rb" | "rake" | "gemspec" => Some(Language::Ruby),
@@ -51,9 +51,9 @@ impl Language {
         match self {
             Language::Rust => &["rs"],
             Language::Python => &["py", "pyw"],
-            Language::TypeScript => &["ts"],
+            Language::TypeScript => &["ts", "mts", "cts"],
             Language::Tsx => &["tsx"],
-            Language::JavaScript => &["js", "jsx"],
+            Language::JavaScript => &["js", "jsx", "mjs", "cjs"],
             Language::Go => &["go"],
             Language::Elixir => &["ex", "exs"],
             Language::Ruby => &["rb", "rake", "gemspec"],

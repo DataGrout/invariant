@@ -39,6 +39,7 @@ pub mod bridge;
 pub mod config;
 pub mod facts;
 pub mod git;
+pub mod lens_state;
 pub mod parser;
 pub mod patch;
 pub mod types;

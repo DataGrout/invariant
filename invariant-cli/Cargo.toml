@@ -14,10 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 # Core
-invariant-core = { path = "../invariant-core", version = "0.7.0" }
+invariant-core = { path = "../invariant-core", version = "0.8.0" }
 
 # Async
 tokio.workspace = true
+futures = "0.3"
 
 # CLI
 clap.workspace = true
