@@ -107,6 +107,7 @@ impl Analyzer {
             Language::Prolog => analyze_prolog(&root, ctx)?,
             Language::CSharp => analyze_csharp(&root, ctx)?,
             Language::TSql => analyze_tsql(&root, ctx)?,
+            Language::PowerShell => analyze_powershell(&root, ctx)?,
             Language::MsBuild => unreachable!("handled above"),
         }
 
@@ -305,6 +306,7 @@ pub(crate) fn is_test_file(filepath: &str) -> bool {
 
     let stem = file.split('.').next().unwrap_or(file);
     let test_named = file.contains(".test.")
+        || file.contains(".Tests.")
         || file.contains(".spec.")
         || stem.starts_with("test_")
         || stem.ends_with("_test")
@@ -2982,6 +2984,454 @@ fn tsql_walk(node: &Node<'_>, func_id: &str, ctx: &mut Ctx<'_>) {
             _ if c.named_child_count() > 0 => tsql_walk(c, func_id, ctx),
             _ => {}
         }
+    }
+}
+
+// ========================================================================
+// PowerShell Analysis
+// ========================================================================
+//
+// `function` and `filter` definitions are functions of the file's module,
+// with their `param()` parameters; classes are modules with methods and
+// constructors. Calls are command names (cmdlets and functions alike),
+// `.Method()` and `[Type]::Method()`; calls in script-block arguments
+// (`Where-Object { … }`) belong to the enclosing function. `Import-Module`,
+// `using module`, `using namespace`, `#Requires -Modules` and dot-sourced
+// paths are dependencies. Top-level statements are the file's `script`.
+
+fn analyze_powershell(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let ext = if ctx.filepath.ends_with(".psm1") {
+        ".psm1"
+    } else {
+        ".ps1"
+    };
+    let (file_id, file_name) = module_id_from_path(ctx.filepath, ext, ".");
+    emit_module(ctx, &file_id, &file_name, ctx.filepath, 1);
+    let mut script: Option<String> = None;
+
+    let mut cursor = root.walk();
+    let children: Vec<Node<'_>> = root.named_children(&mut cursor).collect();
+    for child in children {
+        if child.kind() == "comment" {
+            ps_requires(&child, &file_id, ctx);
+            continue;
+        }
+        ps_top(&child, &file_id, &mut script, ctx);
+    }
+    Ok(())
+}
+
+/// A top-level node: definitions stand alone, anything else is the script.
+fn ps_top(node: &Node<'_>, file_id: &str, script: &mut Option<String>, ctx: &mut Ctx<'_>) {
+    match node.kind() {
+        "statement_list" => {
+            let mut cursor = node.walk();
+            let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+            for c in children {
+                ps_top(&c, file_id, script, ctx);
+            }
+        }
+        "function_statement" => ps_function(node, file_id, file_id, ctx),
+        "class_statement" => ps_class(node, ctx),
+        "enum_statement" => {
+            if let Some(name) = find_child_by_kind(node, "simple_name") {
+                let name = node_text(&name, ctx.code).to_string();
+                let id = scoped_id(&normalize_id(ctx.filepath), &name);
+                emit_module(ctx, &id, &name, &format!("enum:{}", name), node_line(node));
+            }
+        }
+        "comment" => ps_requires(node, file_id, ctx),
+        _ => {
+            let id = match script {
+                Some(id) => id.clone(),
+                None => {
+                    let id = scoped_id(file_id, "script_0");
+                    emit_function(
+                        ctx,
+                        &id,
+                        file_id,
+                        "script",
+                        0,
+                        "public",
+                        node_line(node),
+                        node,
+                    );
+                    *script = Some(id.clone());
+                    id
+                }
+            };
+            ps_walk(node, &id, file_id, ctx);
+        }
+    }
+}
+
+/// `#Requires -Modules A, B` names modules the script needs.
+fn ps_requires(comment: &Node<'_>, file_id: &str, ctx: &mut Ctx<'_>) {
+    let text = node_text(comment, ctx.code);
+    let Some(rest) = text
+        .strip_prefix("#Requires")
+        .or_else(|| text.strip_prefix("#requires"))
+    else {
+        return;
+    };
+    let Some(i) = rest.to_ascii_lowercase().find("-modules") else {
+        return;
+    };
+    let line = node_line(comment);
+    let list = &rest[i + "-modules".len()..];
+    // names and @{ ModuleName = …; ModuleVersion = … } tables, comma-separated
+    let mut depth = 0;
+    let mut parts = vec![String::new()];
+    for ch in list.chars() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(String::new());
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(p) = parts.last_mut() {
+            p.push(ch);
+        }
+    }
+    for part in parts {
+        let part = part.trim();
+        let name = if part.starts_with("@{") {
+            ps_requires_module_name(part)
+        } else {
+            let n = part
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '"' || c == '\'');
+            (!n.is_empty() && !n.starts_with('-')).then(|| n.to_string())
+        };
+        if let Some(n) = name {
+            emit_dependency(ctx, file_id, &n, "requires", line);
+        }
+    }
+}
+
+/// `ModuleName = "Pester"` in a `#Requires -Modules @{ … }` table.
+fn ps_requires_module_name(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let i = lower.find("modulename")?;
+    let after = &text[i + "modulename".len()..];
+    let after = after.trim_start().strip_prefix('=')?.trim_start();
+    let q = after.chars().next()?;
+    if q == '"' || q == '\'' {
+        let rest = &after[1..];
+        rest.find(q).map(|j| rest[..j].to_string())
+    } else {
+        Some(
+            after
+                .split(|c: char| c == ';' || c == '}' || c.is_whitespace())
+                .next()?
+                .to_string(),
+        )
+    }
+}
+
+/// The parameters of a function or script block: its `param()` block, or
+/// `function F($a, $b)`.
+fn ps_parameters<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
+    let mut out = Vec::new();
+    let mut stack = vec![*node];
+    while let Some(n) = stack.pop() {
+        let mut c = n.walk();
+        for child in n.named_children(&mut c) {
+            match child.kind() {
+                "script_parameter" | "class_method_parameter" => out.push(child),
+                // the function's own parameter list and param block, not nested blocks
+                "function_parameter_declaration"
+                | "parameter_list"
+                | "param_block"
+                | "class_method_parameter_list" => stack.push(child),
+                "script_block" if n.kind() == "function_statement" => stack.push(child),
+                _ => {}
+            }
+        }
+    }
+    out.sort_by_key(|p| p.start_byte());
+    out
+}
+
+fn ps_emit_params(params: &[Node<'_>], func_id: &str, ctx: &mut Ctx<'_>) {
+    for (pos, p) in params.iter().enumerate() {
+        let Some(var) = find_child_by_kind(p, "variable") else {
+            continue;
+        };
+        let ty = {
+            let mut found = None;
+            let mut stack = vec![*p];
+            while let Some(n) = stack.pop() {
+                if n.kind() == "type_literal" {
+                    found = Some(
+                        node_text(&n, ctx.code)
+                            .trim_matches(|c| c == '[' || c == ']')
+                            .to_string(),
+                    );
+                    break;
+                }
+                if n.kind() == "script_parameter_default" {
+                    continue;
+                }
+                let mut c = n.walk();
+                stack.extend(n.named_children(&mut c));
+            }
+            found
+        };
+        ctx.facts.push(Fact::new(
+            "function_param",
+            vec![
+                FactValue::String(func_id.to_string()),
+                FactValue::Integer(pos as i64),
+                FactValue::String(node_text(&var, ctx.code).to_string()),
+                match ty {
+                    Some(t) => FactValue::String(clean_param(&t)),
+                    None => FactValue::Atom("unknown".to_string()),
+                },
+            ],
+        ));
+    }
+}
+
+/// `[CmdletBinding()]`, `[OutputType(...)]` on a function's param block.
+fn ps_annotations(node: &Node<'_>, id: &str, ctx: &mut Ctx<'_>) {
+    let Some(block) = find_child_by_kind(node, "script_block") else {
+        return;
+    };
+    let Some(param_block) = find_child_by_kind(&block, "param_block") else {
+        return;
+    };
+    let Some(list) = find_child_by_kind(&param_block, "attribute_list") else {
+        return;
+    };
+    let mut c = list.walk();
+    let attrs: Vec<Node<'_>> = list.named_children(&mut c).collect();
+    for a in attrs {
+        let Some(name) = find_child_by_kind(&a, "attribute_name") else {
+            continue;
+        };
+        let args = find_child_by_kind(&a, "attribute_arguments")
+            .map(|x| clean_param(node_text(&x, ctx.code)))
+            .unwrap_or_default();
+        ctx.facts.push(Fact::new(
+            "annotation",
+            vec![
+                FactValue::String(id.to_string()),
+                FactValue::String(node_text(&name, ctx.code).to_string()),
+                FactValue::String(args),
+            ],
+        ));
+    }
+}
+
+fn ps_function(node: &Node<'_>, scope: &str, module_id: &str, ctx: &mut Ctx<'_>) {
+    let name = find_child_by_kind(node, "function_name")
+        .map(|n| node_text(&n, ctx.code).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let params = ps_parameters(node);
+    let line = node_line(node);
+    let func_id = ctx.unique_id(
+        scoped_id(scope, &format!("{}_{}", name, params.len())),
+        line,
+    );
+    emit_function(
+        ctx,
+        &func_id,
+        module_id,
+        &name,
+        params.len(),
+        "public",
+        line,
+        node,
+    );
+    ps_emit_params(&params, &func_id, ctx);
+    ps_annotations(node, &func_id, ctx);
+    if let Some(block) = find_child_by_kind(node, "script_block") {
+        ps_walk(&block, &func_id, module_id, ctx);
+    }
+}
+
+fn ps_class(node: &Node<'_>, ctx: &mut Ctx<'_>) {
+    let mut c = node.walk();
+    let names: Vec<Node<'_>> = node
+        .named_children(&mut c)
+        .filter(|n| n.kind() == "simple_name")
+        .collect();
+    let Some(first) = names.first() else { return };
+    let class_name = node_text(first, ctx.code).to_string();
+    let class_id = scoped_id(&normalize_id(ctx.filepath), &class_name);
+    emit_module(
+        ctx,
+        &class_id,
+        &class_name,
+        &format!("class:{}", class_name),
+        node_line(node),
+    );
+    // `class A : B, IC` — read from the header text: the grammar does not
+    // parse a qualified base (`System.Exception`) into names.
+    let text = node_text(node, ctx.code);
+    let header = text.split('{').next().unwrap_or("");
+    if let Some((_, bases)) = header.split_once(':') {
+        for b in bases.split(',').map(str::trim).filter(|b| !b.is_empty()) {
+            emit_dependency(ctx, &class_id, b, "inherits", node_line(node));
+        }
+    }
+    let mut c = node.walk();
+    let methods: Vec<Node<'_>> = node
+        .named_children(&mut c)
+        .filter(|n| n.kind() == "class_method_definition")
+        .collect();
+    for m in methods {
+        let Some(mname) = find_child_by_kind(&m, "simple_name") else {
+            continue;
+        };
+        let mname = node_text(&mname, ctx.code).to_string();
+        let params = ps_parameters(&m);
+        let line = node_line(&m);
+        let text = node_text(&m, ctx.code).trim_start().to_ascii_lowercase();
+        let visibility = if text.starts_with("hidden") {
+            "private"
+        } else {
+            "public"
+        };
+        let func_id = ctx.unique_id(
+            scoped_id(&class_id, &format!("{}_{}", mname, params.len())),
+            line,
+        );
+        emit_function(
+            ctx,
+            &func_id,
+            &class_id,
+            &mname,
+            params.len(),
+            visibility,
+            line,
+            &m,
+        );
+        ps_emit_params(&params, &func_id, ctx);
+        if let Some(block) = find_child_by_kind(&m, "script_block") {
+            ps_walk(&block, &func_id, &class_id, ctx);
+        }
+    }
+}
+
+/// `Import-Module X`, `using module X`, `using namespace X`, `. ./x.ps1`.
+fn ps_command_dependency(cmd: &Node<'_>, name: &str, module_id: &str, ctx: &mut Ctx<'_>) {
+    let lower = name.to_ascii_lowercase();
+    let args: Vec<Node<'_>> = match cmd.child_by_field_name("command_elements") {
+        Some(e) => {
+            let mut c = e.walk();
+            e.named_children(&mut c)
+                .filter(|n| n.kind() != "command_argument_sep")
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let text_of = |n: &Node<'_>| {
+        node_text(n, ctx.code)
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string()
+    };
+    let line = node_line(cmd);
+    match lower.as_str() {
+        "import-module" | "ipmo" => {
+            // the first argument that is not a -Parameter or its value
+            let mut skip_next = false;
+            for a in &args {
+                if a.kind() == "command_parameter" {
+                    let p = node_text(a, ctx.code).to_ascii_lowercase();
+                    skip_next = !matches!(p.as_str(), "-name" | "-force" | "-global" | "-passthru");
+                    continue;
+                }
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                let t = text_of(a);
+                emit_dependency(ctx, module_id, &t, "import", line);
+                break;
+            }
+        }
+        "using" if args.len() >= 2 => {
+            let kind = text_of(&args[0]).to_ascii_lowercase();
+            if kind == "module" || kind == "namespace" || kind == "assembly" {
+                let t = text_of(&args[1]);
+                emit_dependency(ctx, module_id, &t, "using", line);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Calls and dependencies in a body; nested functions are their own.
+fn ps_walk(node: &Node<'_>, func_id: &str, module_id: &str, ctx: &mut Ctx<'_>) {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    for child in children {
+        match child.kind() {
+            "function_statement" => {
+                ps_function(&child, func_id, module_id, ctx);
+                continue;
+            }
+            "class_statement" => {
+                ps_class(&child, ctx);
+                continue;
+            }
+            "command" => {
+                let dot = find_child_by_kind(&child, "command_invokation_operator")
+                    .map(|o| node_text(&o, ctx.code).trim() == ".")
+                    .unwrap_or(false);
+                if let Some(name) = child.child_by_field_name("command_name") {
+                    if name.kind() == "command_name" {
+                        let n = node_text(&name, ctx.code).to_string();
+                        // `using module X` is a statement the grammar reads as a command
+                        if !n.eq_ignore_ascii_case("using") {
+                            emit_call(ctx, func_id, &n, node_line(&child));
+                        }
+                        ps_command_dependency(&child, &n, module_id, ctx);
+                    } else if dot {
+                        // . "$PSScriptRoot\private\Helpers.ps1": dot-sourcing a file
+                        let path = node_text(&name, ctx.code)
+                            .trim()
+                            .trim_matches(|c| c == '"' || c == '\'')
+                            .replace('\\', "/");
+                        emit_dependency(ctx, module_id, &path, "dot_source", node_line(&child));
+                    }
+                }
+            }
+            "invokation_expression" => {
+                let mut c = child.walk();
+                let parts: Vec<Node<'_>> = child.named_children(&mut c).collect();
+                let method = parts
+                    .iter()
+                    .rfind(|p| p.kind() == "member_name")
+                    .map(|m| node_text(m, ctx.code).to_string());
+                if let Some(method) = method {
+                    let callee = match parts.first() {
+                        Some(t) if t.kind() == "type_literal" => {
+                            let ty = node_text(t, ctx.code)
+                                .trim_matches(|c| c == '[' || c == ']')
+                                .to_string();
+                            if method.eq_ignore_ascii_case("new") {
+                                ty
+                            } else {
+                                format!("{}::{}", ty, method)
+                            }
+                        }
+                        _ => method,
+                    };
+                    emit_call(ctx, func_id, &callee, node_line(&child));
+                }
+            }
+            _ => {}
+        }
+        ps_walk(&child, func_id, module_id, ctx);
     }
 }
 

@@ -31,6 +31,13 @@ This project follows [Semantic Versioning](https://semver.org/).
   SELECT … INTO, TRUNCATE), so "what writes `Sales.Orders`" is one query.
   Statements outside a routine (deployment and test scripts) belong to the
   file's `script` function.
+- **PowerShell** (`.ps1`, `.psm1`). `function` and `filter` definitions with
+  their `param()` parameters and types, classes with methods and constructors,
+  `[CmdletBinding()]`-style attributes as annotations. Calls are command names,
+  `.Method()` and `[Type]::Method()`; calls in script-block arguments belong to
+  the enclosing function. `Import-Module`, `using module`/`namespace`,
+  `#Requires -Modules` and dot-sourced files are dependencies; top-level
+  statements are the file's `script`, and `*.Tests.ps1` files are tests.
 - **`annotation(Id, Name, Args)`** for C# attributes on types and members, so
   `[HttpGet("orders/{id}")]` routes and `[Authorize]` can be queried.
 - **.NET project files** (`.csproj`, `.fsproj`, `.vbproj`, `.props`,
@@ -55,6 +62,14 @@ precision and recall for C# and for project files.
 On its T-SQL corpus (tSQLt, the First Responder Kit, Wide World Importers;
 644 files), 98.4% of files parse without errors; ground truth 100% precision
 and recall for routines, calls and table reads and writes.
+
+On PowerShell (Pester, dbatools; 2,014 files), 91.7% of files parse without
+errors, and in the rest the grammar still finds 97% of function definitions;
+ground truth 100% precision and recall.
+
+Every grammar dependency passes the vetting in the testbed (`vetting/`): the
+crate only compiles its parser, hand-written scanners are read, the maintainer
+and published commit are known, and the corpus parses.
 
 `tree-sitter-tsql` must be published to crates.io before this release: the
 workspace points at it by path for development.

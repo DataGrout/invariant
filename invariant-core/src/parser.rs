@@ -30,6 +30,8 @@ pub enum Language {
     CSharp,
     /// T-SQL (SQL Server, Azure SQL), with our own grammar
     TSql,
+    /// PowerShell
+    PowerShell,
     /// .NET project and solution files (`.csproj`, `.fsproj`, `.vbproj`,
     /// `Directory.*.props`, `.sln`): read as XML or text, not tree-sitter.
     MsBuild,
@@ -51,6 +53,7 @@ impl Language {
             "pl" | "plt" | "pro" | "prolog" => Some(Language::Prolog),
             "cs" | "csx" => Some(Language::CSharp),
             "sql" => Some(Language::TSql),
+            "ps1" | "psm1" => Some(Language::PowerShell),
             "csproj" | "fsproj" | "vbproj" | "props" | "targets" | "sln" | "slnx" => {
                 Some(Language::MsBuild)
             }
@@ -73,6 +76,7 @@ impl Language {
             Language::Prolog => &["pl", "plt", "pro", "prolog"],
             Language::CSharp => &["cs", "csx"],
             Language::TSql => &["sql"],
+            Language::PowerShell => &["ps1", "psm1"],
             Language::MsBuild => &[
                 "csproj", "fsproj", "vbproj", "props", "targets", "sln", "slnx",
             ],
@@ -93,6 +97,7 @@ impl Language {
             Language::Prolog => "prolog",
             Language::CSharp => "csharp",
             Language::TSql => "tsql",
+            Language::PowerShell => "powershell",
             Language::MsBuild => "msbuild",
         }
     }
@@ -112,6 +117,7 @@ pub struct Parser {
     prolog_parser: TSParser,
     csharp_parser: TSParser,
     tsql_parser: TSParser,
+    powershell_parser: TSParser,
 }
 
 impl Parser {
@@ -177,6 +183,11 @@ impl Parser {
             .set_language(&tree_sitter_tsql::LANGUAGE.into())
             .map_err(|e| Error::Parse(format!("Failed to set T-SQL language: {}", e)))?;
 
+        let mut powershell_parser = TSParser::new();
+        powershell_parser
+            .set_language(&tree_sitter_powershell::LANGUAGE.into())
+            .map_err(|e| Error::Parse(format!("Failed to set PowerShell language: {}", e)))?;
+
         Ok(Self {
             rust_parser,
             python_parser,
@@ -190,6 +201,7 @@ impl Parser {
             prolog_parser,
             csharp_parser,
             tsql_parser,
+            powershell_parser,
         })
     }
 
@@ -208,6 +220,7 @@ impl Parser {
             Language::Prolog => &mut self.prolog_parser,
             Language::CSharp => &mut self.csharp_parser,
             Language::TSql => &mut self.tsql_parser,
+            Language::PowerShell => &mut self.powershell_parser,
             Language::MsBuild => {
                 return Err(Error::Parse(
                     "project files are read as XML, not parsed with tree-sitter".to_string(),

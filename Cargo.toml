@@ -30,6 +30,7 @@ tree-sitter-php = "0.23"
 # MIT Prolog grammar — published from the sibling tree-sitter-grammars repo.
 tree-sitter-prolog = "0.1"
 tree-sitter-c-sharp = "0.23"
+tree-sitter-powershell = "0.26"
 # Our own grammar (tree-sitter-grammars repo); the path is for development until it is published.
 tree-sitter-tsql = { version = "0.1", path = "../tree-sitter-grammars/tree-sitter-tsql" }
 # .NET project files (.csproj, Directory.Packages.props): XML, no grammar.

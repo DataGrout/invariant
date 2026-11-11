@@ -1439,3 +1439,148 @@ fn tsql_calls_and_table_access() {
         );
     }
 }
+
+// ─── PowerShell ──────────────────────────────────────────────────────────────
+
+const PS_SCRIPT: &str = r#"#Requires -Modules dbatools, @{ ModuleName="Pester"; ModuleVersion="5.0" }
+using module ./Fleet.psm1
+Import-Module -Name SqlServer -MinimumVersion 22.0
+. "$PSScriptRoot\private\Helpers.ps1"
+
+function Get-DbaThing {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]$SqlInstance,
+        [int]$Timeout = 30
+    )
+    $server = Connect-DbaInstance -SqlInstance $SqlInstance
+    $rows = Invoke-DbaQuery -SqlInstance $server -Query "SELECT 1" | Where-Object { Test-Row $_ }
+    $server.Databases.Refresh()
+    [System.IO.File]::ReadAllText("x")
+    function Inner { Write-Host "x" }
+    Inner
+}
+
+class Fleet : System.Object {
+    [string]$Name
+    Fleet([string]$n) { $this.Name = $n }
+    hidden [void] Start() { Start-Job -ScriptBlock { Get-Date } }
+    static [Fleet] Create() { return [Fleet]::new("x") }
+}
+
+Get-DbaThing -SqlInstance localhost
+"#;
+
+fn lens_ps(code: &str, path: &str) -> Vec<String> {
+    Analyzer::new()
+        .unwrap()
+        .lens_code(code, Language::PowerShell, path, "sha")
+        .unwrap()
+        .facts
+}
+
+#[test]
+fn powershell_functions_parameters_and_classes() {
+    let facts = lens_ps(PS_SCRIPT, "tools/Get-DbaThing.ps1");
+    let f = "tools_get_dbathing__get_dbathing_2";
+    assert!(has_fact(
+        &facts,
+        &format!("function('{f}', 'tools_get_dbathing', 'Get-DbaThing', 2, public")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function_param('{f}', 0, '$SqlInstance', 'string')")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function_param('{f}', 1, '$Timeout', 'int')")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{f}', 'CmdletBinding', '')")
+    ));
+    assert!(has_fact(&facts, &format!("function('{f}__inner_0'")));
+    let c = "tools_get_dbathing_ps1__fleet";
+    assert!(has_fact(
+        &facts,
+        &format!("module('{c}', 'Fleet', 'class:Fleet'")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{c}', 'System.Object', inherits")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{c}__fleet_1', '{c}', 'Fleet', 1, public")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{c}__start_0', '{c}', 'Start', 0, private")
+    ));
+    // top-level statements are the script
+    assert!(has_fact(
+        &facts,
+        "calls_external('tools_get_dbathing__script_0', 'unknown', 'Get-DbaThing'"
+    ));
+}
+
+#[test]
+fn powershell_calls_and_dependencies() {
+    let facts = lens_ps(PS_SCRIPT, "tools/Get-DbaThing.ps1");
+    let f = "tools_get_dbathing__get_dbathing_2";
+    for callee in [
+        "Connect-DbaInstance",
+        "Invoke-DbaQuery",
+        "Where-Object",
+        "Test-Row",
+        "Refresh",
+        "System.IO.File::ReadAllText",
+        "Inner",
+    ] {
+        assert!(
+            has_fact(
+                &facts,
+                &format!("calls_external('{f}', 'unknown', '{callee}'")
+            ),
+            "{callee}"
+        );
+    }
+    // the nested function's calls are its own
+    assert!(!has_fact(
+        &facts,
+        &format!("calls_external('{f}', 'unknown', 'Write-Host'")
+    ));
+    assert!(has_fact(
+        &facts,
+        "calls_external('tools_get_dbathing_ps1__fleet__create_0', 'unknown', 'Fleet'"
+    ));
+    let m = "tools_get_dbathing";
+    for (target, kind) in [
+        ("dbatools", "requires"),
+        ("Pester", "requires"),
+        ("./Fleet.psm1", "using"),
+        ("SqlServer", "import"),
+        ("$PSScriptRoot/private/Helpers.ps1", "dot_source"),
+    ] {
+        assert!(
+            has_fact(&facts, &format!("depends_on('{m}', '{target}', {kind}")),
+            "{target}"
+        );
+    }
+    assert!(!facts
+        .iter()
+        .any(|f| f.starts_with("calls_external") && f.contains("'using'")));
+}
+
+#[test]
+fn powershell_pester_files_are_tests() {
+    let facts = lens_ps(
+        "Describe 'Get-DbaThing' { It 'works' { Get-DbaThing | Should -Be 1 } }\nfunction New-Fixture { }\n",
+        "tests/Get-DbaThing.Tests.ps1",
+    );
+    assert!(has_fact(
+        &facts,
+        "test('tests_get_dbathing_tests__new_fixture_0', '', test_helper)"
+    ));
+}
