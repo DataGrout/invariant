@@ -21,6 +21,16 @@ This project follows [Semantic Versioning](https://semver.org/).
   directives and base types are dependencies; `: base(…)` calls the base
   class's constructor. `[Fact]`, `[Theory]`, `[Test]`, `[TestMethod]` and
   `[TestCase]` mark tests, as do `*.Tests` project directories.
+- **T-SQL** (`.sql`), with our own grammar (`tree-sitter-tsql`; the generic SQL
+  grammars leave 65–91% of SQL Server code under error nodes). Procedures,
+  functions, views and triggers are functions of their schema's module (`dbo`
+  when unqualified), annotated with their kind; `CREATE TABLE` makes the table
+  a module. Calls are EXEC targets and `name(…)` calls. Table access is two new
+  facts, `reads_table(Func, Table, Line)` (FROM, JOIN, comma-joined tables) and
+  `writes_table(Func, Table, Line)` (INSERT, UPDATE, DELETE, MERGE,
+  SELECT … INTO, TRUNCATE), so "what writes `Sales.Orders`" is one query.
+  Statements outside a routine (deployment and test scripts) belong to the
+  file's `script` function.
 - **`annotation(Id, Name, Args)`** for C# attributes on types and members, so
   `[HttpGet("orders/{id}")]` routes and `[Authorize]` can be queried.
 - **.NET project files** (`.csproj`, `.fsproj`, `.vbproj`, `.props`,
@@ -41,6 +51,13 @@ On the testbed's C# corpus (Newtonsoft.Json, OrchardCore; 7,752 files),
 99.4% of files parse without errors, 29,062 functions, 14 duplicate ids
 (types of one name and namespace in different assemblies); ground truth 100%
 precision and recall for C# and for project files.
+
+On its T-SQL corpus (tSQLt, the First Responder Kit, Wide World Importers;
+644 files), 98.4% of files parse without errors; ground truth 100% precision
+and recall for routines, calls and table reads and writes.
+
+`tree-sitter-tsql` must be published to crates.io before this release: the
+workspace points at it by path for development.
 
 ---
 

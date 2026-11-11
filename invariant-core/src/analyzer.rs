@@ -106,6 +106,7 @@ impl Analyzer {
             Language::Php => analyze_php(&root, ctx)?,
             Language::Prolog => analyze_prolog(&root, ctx)?,
             Language::CSharp => analyze_csharp(&root, ctx)?,
+            Language::TSql => analyze_tsql(&root, ctx)?,
             Language::MsBuild => unreachable!("handled above"),
         }
 
@@ -2566,6 +2567,421 @@ fn csharp_callee(function: &Node<'_>, code: &[u8]) -> Option<String> {
             .child_by_field_name("name")
             .map(|n| csharp_type_name(&n, code)),
         _ => None,
+    }
+}
+
+// ========================================================================
+// T-SQL Analysis
+// ========================================================================
+//
+// Procedures, functions, views and triggers are functions of their schema's
+// module (`dbo` when the name has none), annotated with their kind. A
+// routine's calls are its EXEC targets and `name(…)` calls; its table access
+// is `reads_table(Func, Table, Line)` (FROM, JOIN, comma-joined tables) and
+// `writes_table(Func, Table, Line)` (INSERT, UPDATE, DELETE, MERGE,
+// SELECT … INTO, TRUNCATE). `CREATE TABLE` makes the table a module.
+// Statements outside any routine (deployment scripts, test setup) belong to
+// the file's `script` function.
+
+/// Words followed by `(` that are not calls: operators, clauses, constraint
+/// and type syntax.
+const TSQL_NOT_CALLS: &[&str] = &[
+    "IN",
+    "OVER",
+    "AS",
+    "AND",
+    "OR",
+    "NOT",
+    "WHERE",
+    "ON",
+    "INTO",
+    "TABLE",
+    "KEY",
+    "UNIQUE",
+    "CHECK",
+    "REFERENCES",
+    "INCLUDE",
+    "WITH",
+    "OPTION",
+    "INDEX",
+    "DEFAULT",
+    "FOREIGN",
+    "PRIMARY",
+    "CONSTRAINT",
+    "VALUES",
+    "EXISTS",
+    "SET",
+    "FROM",
+    "JOIN",
+    "APPLY",
+    "BY",
+    "IS",
+    "THEN",
+    "ELSE",
+    "WHEN",
+    "RETURNS",
+    "OUTPUT",
+    "PERCENT",
+    "TOP",
+    "PARTITION",
+    "FOR",
+    "XML",
+    "PATH",
+    "JSON",
+    "CHAR",
+    "VARCHAR",
+    "NCHAR",
+    "NVARCHAR",
+    "BINARY",
+    "VARBINARY",
+    "DECIMAL",
+    "NUMERIC",
+    "FLOAT",
+    "DATETIME2",
+    "DATETIMEOFFSET",
+    "TIME",
+    "IDENTITY",
+    "ROWS",
+    "RANGE",
+    "ROOT",
+    "AUTO",
+    "RAW",
+    "EXPLICIT",
+    "MAXDOP",
+    "RECOMPILE",
+];
+
+/// Words that end a FROM list.
+const TSQL_CLAUSE_WORDS: &[&str] = &[
+    "WHERE",
+    "GROUP",
+    "ORDER",
+    "HAVING",
+    "ON",
+    "OPTION",
+    "SET",
+    "OUTPUT",
+    "UNION",
+    "EXCEPT",
+    "INTERSECT",
+    "FOR",
+    "WINDOW",
+    "PIVOT",
+    "UNPIVOT",
+    "WHEN",
+    "THEN",
+    "USING",
+];
+
+/// `[dbo].[Orders]` → `dbo.Orders`; brackets and quotes off each part.
+fn tsql_name(text: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '[' => {
+                while let Some(d) = chars.next() {
+                    if d == ']' {
+                        if chars.peek() == Some(&']') {
+                            chars.next();
+                            cur.push(']');
+                        } else {
+                            break;
+                        }
+                    } else {
+                        cur.push(d);
+                    }
+                }
+            }
+            '"' => {
+                for d in chars.by_ref() {
+                    if d == '"' {
+                        break;
+                    }
+                    cur.push(d);
+                }
+            }
+            '.' => parts.push(std::mem::take(&mut cur)),
+            c if c.is_whitespace() => {}
+            c => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    parts.join(".")
+}
+
+struct TsqlScope<'s> {
+    file_id: &'s str,
+    script: Option<String>,
+    schemas: std::collections::HashSet<String>,
+}
+
+fn analyze_tsql(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let (file_id, file_name) = module_id_from_path(ctx.filepath, ".sql", ".");
+    emit_module(ctx, &file_id, &file_name, ctx.filepath, 1);
+    let mut scope = TsqlScope {
+        file_id: &file_id,
+        script: None,
+        schemas: std::collections::HashSet::new(),
+    };
+    let mut cursor = root.walk();
+    let children: Vec<Node<'_>> = root.named_children(&mut cursor).collect();
+    for child in children {
+        match child.kind() {
+            "create_procedure" | "create_function" | "create_view" | "create_trigger" => {
+                tsql_routine(&child, &mut scope, ctx)
+            }
+            "batch_separator" | "sqlcmd_command" | "comment" => {}
+            _ => {
+                if child.kind() == "create_table" {
+                    tsql_table_module(&child, &mut scope, ctx);
+                }
+                let id = match &scope.script {
+                    Some(id) => id.clone(),
+                    None => {
+                        let id = scoped_id(scope.file_id, "script_0");
+                        let module = scope.file_id.to_string();
+                        emit_function(
+                            ctx,
+                            &id,
+                            &module,
+                            "script",
+                            0,
+                            "public",
+                            node_line(&child),
+                            &child,
+                        );
+                        scope.script = Some(id.clone());
+                        id
+                    }
+                };
+                tsql_walk(&child, &id, ctx);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The schema's module, emitted once per file: (module id, object name).
+fn tsql_schema_module(
+    qualified: &str,
+    line: usize,
+    scope: &mut TsqlScope<'_>,
+    ctx: &mut Ctx<'_>,
+) -> (String, String) {
+    let parts: Vec<&str> = qualified.split('.').collect();
+    let object = parts.last().copied().unwrap_or(qualified).to_string();
+    let schema = if parts.len() >= 2 {
+        parts[parts.len() - 2]
+    } else {
+        "dbo"
+    };
+    let schema = if schema.is_empty() { "dbo" } else { schema };
+    let schema_id = normalize_id(schema);
+    if scope.schemas.insert(schema_id.clone()) {
+        emit_module(ctx, &schema_id, schema, &format!("schema:{}", schema), line);
+    }
+    (schema_id, object)
+}
+
+fn tsql_table_module(node: &Node<'_>, scope: &mut TsqlScope<'_>, ctx: &mut Ctx<'_>) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    if name.kind() != "object_name" {
+        return; // #temp and @table variables are not part of the schema
+    }
+    let qualified = tsql_name(node_text(&name, ctx.code));
+    let (schema_id, object) = tsql_schema_module(&qualified, node_line(node), scope, ctx);
+    let table_id = scoped_id(&schema_id, &object);
+    let label = format!(
+        "{}.{}",
+        qualified.rsplit_once('.').map(|(s, _)| s).unwrap_or("dbo"),
+        object
+    );
+    emit_module(
+        ctx,
+        &table_id,
+        &label,
+        &format!("table:{}", label),
+        node_line(node),
+    );
+}
+
+fn tsql_routine(node: &Node<'_>, scope: &mut TsqlScope<'_>, ctx: &mut Ctx<'_>) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let qualified = tsql_name(node_text(&name, ctx.code));
+    let line = node_line(node);
+    let (schema_id, object) = tsql_schema_module(&qualified, line, scope, ctx);
+    let arity = node
+        .child_by_field_name("parameters")
+        .map(|p| {
+            let mut c = p.walk();
+            let n = p
+                .named_children(&mut c)
+                .filter(|x| x.kind() == "parameter")
+                .count();
+            n
+        })
+        .unwrap_or(0);
+    let func_id = ctx.unique_id(
+        scoped_id(&schema_id, &format!("{}_{}", object, arity)),
+        line,
+    );
+    emit_function(
+        ctx, &func_id, &schema_id, &object, arity, "public", line, node,
+    );
+    let kind = node.kind().trim_start_matches("create_").to_string();
+    ctx.facts.push(Fact::new(
+        "annotation",
+        vec![
+            FactValue::String(func_id.clone()),
+            FactValue::String(kind),
+            FactValue::String(String::new()),
+        ],
+    ));
+    if node.kind() == "create_trigger" {
+        if let Some(t) = node.child_by_field_name("table") {
+            let table = tsql_name(node_text(&t, ctx.code));
+            ctx.facts.push(Fact::new(
+                "annotation",
+                vec![
+                    FactValue::String(func_id.clone()),
+                    FactValue::String("on".to_string()),
+                    FactValue::String(table),
+                ],
+            ));
+        }
+    }
+    for field in ["body", "returns"] {
+        if let Some(body) = node.child_by_field_name(field) {
+            tsql_walk(&body, &func_id, ctx);
+        }
+    }
+}
+
+fn tsql_table_fact(ctx: &mut Ctx<'_>, func_id: &str, table: &Node<'_>, predicate: &str) {
+    if table.kind() == "variable" {
+        return; // @table variables are local
+    }
+    let name = tsql_name(node_text(table, ctx.code));
+    ctx.facts.push(Fact::new(
+        predicate,
+        vec![
+            FactValue::String(func_id.to_string()),
+            FactValue::String(name),
+            FactValue::Integer(node_line(table) as i64),
+        ],
+    ));
+}
+
+/// Calls and table access in a statement or body, in source order.
+fn tsql_walk(node: &Node<'_>, func_id: &str, ctx: &mut Ctx<'_>) {
+    let kind = node.kind();
+    // The table a data statement writes, which is not also a read or a call.
+    let target = node.child_by_field_name("table");
+    if matches!(
+        kind,
+        "insert_statement" | "update_statement" | "delete_statement" | "merge_statement"
+    ) {
+        if let Some(t) = target {
+            tsql_table_fact(ctx, func_id, &t, "writes_table");
+        }
+    }
+    if kind == "exec_statement" {
+        if let Some(p) = node.child_by_field_name("procedure") {
+            if p.kind() == "object_name" {
+                let name = tsql_name(node_text(&p, ctx.code));
+                emit_call(ctx, func_id, &name, node_line(&p));
+            }
+        }
+    }
+    if kind == "other_statement" {
+        // TRUNCATE TABLE t
+        let first = node
+            .child(0)
+            .map(|n| n.kind().to_string())
+            .unwrap_or_default();
+        if first == "TRUNCATE" {
+            let mut c = node.walk();
+            if let Some(t) = node
+                .named_children(&mut c)
+                .find(|n| matches!(n.kind(), "object_name" | "temp_name"))
+            {
+                tsql_table_fact(ctx, func_id, &t, "writes_table");
+            }
+            return;
+        }
+    }
+
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+    let skip_ids: Vec<usize> = [
+        target,
+        node.child_by_field_name("procedure"),
+        node.child_by_field_name("name"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|n| n.id())
+    .collect();
+    // Some("read"/"write") when the next name is a table.
+    let mut expect: Option<&'static str> = None;
+    let mut in_from = false;
+    for (i, c) in children.iter().enumerate() {
+        if skip_ids.contains(&c.id()) {
+            continue;
+        }
+        let next_is_paren = children
+            .get(i + 1)
+            .is_some_and(|n| n.kind() == "parenthesized");
+        match c.kind() {
+            "FROM" => {
+                expect = Some("reads_table");
+                in_from = true;
+            }
+            "INTO" if kind == "select_statement" => expect = Some("writes_table"),
+            "," if in_from => expect = Some("reads_table"),
+            "object_name" => {
+                let text = node_text(c, ctx.code);
+                let upper = text.to_ascii_uppercase();
+                if matches!(upper.as_str(), "JOIN" | "APPLY") {
+                    expect = Some("reads_table");
+                    in_from = true;
+                    continue;
+                }
+                if TSQL_CLAUSE_WORDS.contains(&upper.as_str()) {
+                    in_from = false;
+                    expect = None;
+                    continue;
+                }
+                match expect.take() {
+                    Some(_) if next_is_paren => {
+                        // FROM dbo.fn(@x): a table-valued function
+                        emit_call(ctx, func_id, &tsql_name(text), node_line(c));
+                    }
+                    Some(pred) => tsql_table_fact(ctx, func_id, c, pred),
+                    None if next_is_paren && !TSQL_NOT_CALLS.contains(&upper.as_str()) => {
+                        emit_call(ctx, func_id, &tsql_name(text), node_line(c));
+                    }
+                    None => {}
+                }
+            }
+            "temp_name" | "variable" => {
+                if let Some(pred) = expect.take() {
+                    tsql_table_fact(ctx, func_id, c, pred);
+                }
+            }
+            "parenthesized" => {
+                expect = None;
+                tsql_walk(c, func_id, ctx);
+            }
+            _ if c.named_child_count() > 0 => tsql_walk(c, func_id, ctx),
+            _ => {}
+        }
     }
 }
 

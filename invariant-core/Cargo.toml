@@ -28,6 +28,7 @@ tree-sitter-ruby.workspace = true
 tree-sitter-php.workspace = true
 tree-sitter-prolog.workspace = true
 tree-sitter-c-sharp.workspace = true
+tree-sitter-tsql.workspace = true
 quick-xml.workspace = true
 
 # Serialization

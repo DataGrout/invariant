@@ -28,6 +28,8 @@ pub enum Language {
     Prolog,
     /// C#
     CSharp,
+    /// T-SQL (SQL Server, Azure SQL), with our own grammar
+    TSql,
     /// .NET project and solution files (`.csproj`, `.fsproj`, `.vbproj`,
     /// `Directory.*.props`, `.sln`): read as XML or text, not tree-sitter.
     MsBuild,
@@ -48,6 +50,7 @@ impl Language {
             "php" | "phtml" => Some(Language::Php),
             "pl" | "plt" | "pro" | "prolog" => Some(Language::Prolog),
             "cs" | "csx" => Some(Language::CSharp),
+            "sql" => Some(Language::TSql),
             "csproj" | "fsproj" | "vbproj" | "props" | "targets" | "sln" | "slnx" => {
                 Some(Language::MsBuild)
             }
@@ -69,6 +72,7 @@ impl Language {
             Language::Php => &["php", "phtml"],
             Language::Prolog => &["pl", "plt", "pro", "prolog"],
             Language::CSharp => &["cs", "csx"],
+            Language::TSql => &["sql"],
             Language::MsBuild => &[
                 "csproj", "fsproj", "vbproj", "props", "targets", "sln", "slnx",
             ],
@@ -88,6 +92,7 @@ impl Language {
             Language::Php => "php",
             Language::Prolog => "prolog",
             Language::CSharp => "csharp",
+            Language::TSql => "tsql",
             Language::MsBuild => "msbuild",
         }
     }
@@ -106,6 +111,7 @@ pub struct Parser {
     php_parser: TSParser,
     prolog_parser: TSParser,
     csharp_parser: TSParser,
+    tsql_parser: TSParser,
 }
 
 impl Parser {
@@ -166,6 +172,11 @@ impl Parser {
             .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
             .map_err(|e| Error::Parse(format!("Failed to set C# language: {}", e)))?;
 
+        let mut tsql_parser = TSParser::new();
+        tsql_parser
+            .set_language(&tree_sitter_tsql::LANGUAGE.into())
+            .map_err(|e| Error::Parse(format!("Failed to set T-SQL language: {}", e)))?;
+
         Ok(Self {
             rust_parser,
             python_parser,
@@ -178,6 +189,7 @@ impl Parser {
             php_parser,
             prolog_parser,
             csharp_parser,
+            tsql_parser,
         })
     }
 
@@ -195,6 +207,7 @@ impl Parser {
             Language::Php => &mut self.php_parser,
             Language::Prolog => &mut self.prolog_parser,
             Language::CSharp => &mut self.csharp_parser,
+            Language::TSql => &mut self.tsql_parser,
             Language::MsBuild => {
                 return Err(Error::Parse(
                     "project files are read as XML, not parsed with tree-sitter".to_string(),

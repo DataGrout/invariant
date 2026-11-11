@@ -1325,3 +1325,117 @@ fn msbuild_project_files_are_dependencies() {
         "depends_on('acme_sln', 'src/Acme.Api/Acme.Api.csproj', project, 2)"
     ));
 }
+
+// ─── T-SQL ───────────────────────────────────────────────────────────────────
+
+fn lens_sql(code: &str, path: &str) -> Vec<String> {
+    Analyzer::new()
+        .unwrap()
+        .lens_code(code, Language::TSql, path, "sha")
+        .unwrap()
+        .facts
+}
+
+const TSQL_PROC: &str = "\u{feff}SET ANSI_NULLS ON;
+GO
+CREATE OR ALTER PROCEDURE [Sales].[CloseOrder] @OrderID int, @Note AS nvarchar(100) = NULL OUTPUT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @n int = dbo.CountLines(@OrderID);
+    IF @n = 0
+        RETURN;
+    ELSE
+        UPDATE Sales.Orders SET ClosedWhen = SYSDATETIME() WHERE OrderID = @OrderID;
+    INSERT INTO #log (id) SELECT o.OrderID FROM Sales.Orders AS o JOIN Sales.OrderLines ol ON ol.OrderID = o.OrderID;
+    SELECT * INTO #copy FROM Warehouse.Items, Warehouse.Groups g WHERE g.Id IN (1, 2);
+    DELETE FROM Sales.Holds WHERE OrderID = @OrderID;
+    BEGIN TRY
+        EXEC Audit.Record @OrderID;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END;
+GO
+CREATE FUNCTION dbo.Lines(@id int) RETURNS TABLE AS RETURN SELECT * FROM Sales.OrderLines WHERE OrderID = @id;
+GO
+CREATE TABLE dbo.Audit (Id int PRIMARY KEY, Note nvarchar(max));
+GO
+";
+
+#[test]
+fn tsql_routines_are_functions_of_their_schema() {
+    let facts = lens_sql(TSQL_PROC, "db/Sales/CloseOrder.sql");
+    assert!(has_fact(&facts, "module('sales', 'Sales', 'schema:Sales'"));
+    assert!(has_fact(
+        &facts,
+        "function('sales__closeorder_2', 'sales', 'CloseOrder', 2, public"
+    ));
+    assert!(has_fact(
+        &facts,
+        "function_param('sales__closeorder_2', 1, '@Note'"
+    ));
+    assert!(has_fact(
+        &facts,
+        "annotation('sales__closeorder_2', 'procedure', '')"
+    ));
+    assert!(has_fact(
+        &facts,
+        "function('dbo__lines_1', 'dbo', 'Lines', 1, public"
+    ));
+    assert!(has_fact(
+        &facts,
+        "annotation('dbo__lines_1', 'function', '')"
+    ));
+    assert!(has_fact(
+        &facts,
+        "module('dbo__audit', 'dbo.Audit', 'table:dbo.Audit'"
+    ));
+    // SET ANSI_NULLS and the CREATE TABLE are the file's script
+    assert!(has_fact(&facts, "function('db_sales_closeorder__script_0'"));
+}
+
+#[test]
+fn tsql_calls_and_table_access() {
+    let facts = lens_sql(TSQL_PROC, "db/Sales/CloseOrder.sql");
+    let id = "sales__closeorder_2";
+    for callee in ["dbo.CountLines", "SYSDATETIME", "Audit.Record"] {
+        assert!(
+            has_fact(
+                &facts,
+                &format!("calls_external('{id}', 'unknown', '{callee}'")
+            ),
+            "{callee}"
+        );
+    }
+    for (pred, table) in [
+        ("writes_table", "Sales.Orders"),
+        ("writes_table", "#log"),
+        ("reads_table", "Sales.Orders"),
+        ("reads_table", "Sales.OrderLines"),
+        ("writes_table", "#copy"),
+        ("reads_table", "Warehouse.Items"),
+        ("reads_table", "Warehouse.Groups"),
+        ("writes_table", "Sales.Holds"),
+    ] {
+        assert!(
+            has_fact(&facts, &format!("{pred}('{id}', '{table}'")),
+            "{pred} {table}"
+        );
+    }
+    assert!(has_fact(
+        &facts,
+        "reads_table('dbo__lines_1', 'Sales.OrderLines'"
+    ));
+    // keywords, types and IN (…) are not calls; neither is the INSERT's column list
+    for not_call in ["'IN'", "'nvarchar'", "'#log'", "'max'"] {
+        assert!(
+            !facts
+                .iter()
+                .any(|f| f.starts_with("calls_external") && f.contains(not_call)),
+            "{not_call}"
+        );
+    }
+}

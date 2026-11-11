@@ -190,6 +190,7 @@ Show connection, identity, and configuration status.
 | PHP        | tree-sitter| `.php`, `.phtml` |
 | Prolog     | tree-sitter| `.pl`, `.plt`, `.pro`, `.prolog` |
 | C#         | tree-sitter| `.cs`, `.csx`    |
+| T-SQL      | tree-sitter ([ours](https://github.com/DataGrout/tree-sitter-grammars/tree/main/tree-sitter-tsql)) | `.sql` |
 | .NET projects | XML     | `.csproj`, `.fsproj`, `.vbproj`, `.props`, `.targets`, `.sln` |
 
 ## Architecture
