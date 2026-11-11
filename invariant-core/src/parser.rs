@@ -26,6 +26,19 @@ pub enum Language {
     Php,
     /// Prolog (ISO + SWI + ProbLog superset)
     Prolog,
+    /// C#
+    CSharp,
+    /// T-SQL (SQL Server, Azure SQL), with our own grammar
+    TSql,
+    /// PowerShell
+    PowerShell,
+    /// Java
+    Java,
+    /// Kotlin
+    Kotlin,
+    /// .NET project and solution files (`.csproj`, `.fsproj`, `.vbproj`,
+    /// `Directory.*.props`, `.sln`): read as XML or text, not tree-sitter.
+    MsBuild,
 }
 
 impl Language {
@@ -42,6 +55,14 @@ impl Language {
             "rb" | "rake" | "gemspec" => Some(Language::Ruby),
             "php" | "phtml" => Some(Language::Php),
             "pl" | "plt" | "pro" | "prolog" => Some(Language::Prolog),
+            "cs" | "csx" => Some(Language::CSharp),
+            "sql" => Some(Language::TSql),
+            "ps1" | "psm1" => Some(Language::PowerShell),
+            "java" => Some(Language::Java),
+            "kt" | "kts" => Some(Language::Kotlin),
+            "csproj" | "fsproj" | "vbproj" | "props" | "targets" | "sln" | "slnx" => {
+                Some(Language::MsBuild)
+            }
             _ => None,
         }
     }
@@ -59,6 +80,14 @@ impl Language {
             Language::Ruby => &["rb", "rake", "gemspec"],
             Language::Php => &["php", "phtml"],
             Language::Prolog => &["pl", "plt", "pro", "prolog"],
+            Language::CSharp => &["cs", "csx"],
+            Language::TSql => &["sql"],
+            Language::PowerShell => &["ps1", "psm1"],
+            Language::Java => &["java"],
+            Language::Kotlin => &["kt", "kts"],
+            Language::MsBuild => &[
+                "csproj", "fsproj", "vbproj", "props", "targets", "sln", "slnx",
+            ],
         }
     }
 
@@ -74,6 +103,12 @@ impl Language {
             Language::Ruby => "ruby",
             Language::Php => "php",
             Language::Prolog => "prolog",
+            Language::CSharp => "csharp",
+            Language::TSql => "tsql",
+            Language::PowerShell => "powershell",
+            Language::Java => "java",
+            Language::Kotlin => "kotlin",
+            Language::MsBuild => "msbuild",
         }
     }
 }
@@ -90,6 +125,11 @@ pub struct Parser {
     ruby_parser: TSParser,
     php_parser: TSParser,
     prolog_parser: TSParser,
+    csharp_parser: TSParser,
+    tsql_parser: TSParser,
+    powershell_parser: TSParser,
+    java_parser: TSParser,
+    kotlin_parser: TSParser,
 }
 
 impl Parser {
@@ -145,6 +185,31 @@ impl Parser {
             .set_language(&tree_sitter_prolog::LANGUAGE.into())
             .map_err(|e| Error::Parse(format!("Failed to set Prolog language: {}", e)))?;
 
+        let mut csharp_parser = TSParser::new();
+        csharp_parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .map_err(|e| Error::Parse(format!("Failed to set C# language: {}", e)))?;
+
+        let mut tsql_parser = TSParser::new();
+        tsql_parser
+            .set_language(&tree_sitter_tsql::LANGUAGE.into())
+            .map_err(|e| Error::Parse(format!("Failed to set T-SQL language: {}", e)))?;
+
+        let mut powershell_parser = TSParser::new();
+        powershell_parser
+            .set_language(&tree_sitter_powershell::LANGUAGE.into())
+            .map_err(|e| Error::Parse(format!("Failed to set PowerShell language: {}", e)))?;
+
+        let mut java_parser = TSParser::new();
+        java_parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .map_err(|e| Error::Parse(format!("Failed to set Java language: {}", e)))?;
+
+        let mut kotlin_parser = TSParser::new();
+        kotlin_parser
+            .set_language(&tree_sitter_kotlin_sg::LANGUAGE.into())
+            .map_err(|e| Error::Parse(format!("Failed to set Kotlin language: {}", e)))?;
+
         Ok(Self {
             rust_parser,
             python_parser,
@@ -156,6 +221,11 @@ impl Parser {
             ruby_parser,
             php_parser,
             prolog_parser,
+            csharp_parser,
+            tsql_parser,
+            powershell_parser,
+            java_parser,
+            kotlin_parser,
         })
     }
 
@@ -172,6 +242,16 @@ impl Parser {
             Language::Ruby => &mut self.ruby_parser,
             Language::Php => &mut self.php_parser,
             Language::Prolog => &mut self.prolog_parser,
+            Language::CSharp => &mut self.csharp_parser,
+            Language::TSql => &mut self.tsql_parser,
+            Language::PowerShell => &mut self.powershell_parser,
+            Language::Java => &mut self.java_parser,
+            Language::Kotlin => &mut self.kotlin_parser,
+            Language::MsBuild => {
+                return Err(Error::Parse(
+                    "project files are read as XML, not parsed with tree-sitter".to_string(),
+                ))
+            }
         };
 
         parser

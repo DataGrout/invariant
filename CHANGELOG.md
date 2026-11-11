@@ -6,6 +6,89 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **C#** (`.cs`, `.csx`). A type's module id is its namespace-qualified name
+  with its type parameters (`Acme.Orders.Result<T>`), so the parts of a
+  partial class across files are one module and `Result` and `Result<T>` are
+  two. Methods, constructors (named for the type, which is what `new T()`
+  calls), finalizers, operators (`op_Addition`), properties and indexers with
+  bodies, event accessors, local functions and top-level statements (the
+  file's `Main`) are functions; auto-properties carry no code and are left
+  out. Accessibility follows C#'s defaults, `internal` included. `using`
+  directives and base types are dependencies; `: base(…)` calls the base
+  class's constructor. `[Fact]`, `[Theory]`, `[Test]`, `[TestMethod]` and
+  `[TestCase]` mark tests, as do `*.Tests` project directories.
+- **T-SQL** (`.sql`), with our own grammar (`tree-sitter-tsql`; the generic SQL
+  grammars leave 65–91% of SQL Server code under error nodes). Procedures,
+  functions, views and triggers are functions of their schema's module (`dbo`
+  when unqualified), annotated with their kind; `CREATE TABLE` makes the table
+  a module. Calls are EXEC targets and `name(…)` calls. Table access is two new
+  facts, `reads_table(Func, Table, Line)` (FROM, JOIN, comma-joined tables) and
+  `writes_table(Func, Table, Line)` (INSERT, UPDATE, DELETE, MERGE,
+  SELECT … INTO, TRUNCATE), so "what writes `Sales.Orders`" is one query.
+  Statements outside a routine (deployment and test scripts) belong to the
+  file's `script` function.
+- **PowerShell** (`.ps1`, `.psm1`). `function` and `filter` definitions with
+  their `param()` parameters and types, classes with methods and constructors,
+  `[CmdletBinding()]`-style attributes as annotations. Calls are command names,
+  `.Method()` and `[Type]::Method()`; calls in script-block arguments belong to
+  the enclosing function. `Import-Module`, `using module`/`namespace`,
+  `#Requires -Modules` and dot-sourced files are dependencies; top-level
+  statements are the file's `script`, and `*.Tests.ps1` files are tests.
+- **Java** (`.java`). As C#: types are modules named by package and type
+  parameters, methods and constructors are functions (package-private ones
+  have visibility `package`), annotations are `annotation/3` (Spring's
+  `@GetMapping` routes), imports and extends/implements are dependencies,
+  `@Test`-style annotations mark tests, and anonymous classes' methods are
+  functions of their own.
+- **Kotlin** (`.kt`, `.kts`). Classes, interfaces, objects and companion
+  objects are modules; member, top-level and local functions, primary and
+  secondary constructors and properties with accessors are functions; an
+  extension function's receiver is an annotation; Gradle scripts' statements
+  are the file's `script`. Uses `tree-sitter-kotlin-sg` (ast-grep's maintained
+  fork): `tree-sitter-kotlin-ng` left 5–14% of the corpus under parse errors.
+- **`annotation(Id, Name, Args)`** for C# attributes on types and members, so
+  `[HttpGet("orders/{id}")]` routes and `[Authorize]` can be queried.
+- **.NET project files** (`.csproj`, `.fsproj`, `.vbproj`, `.props`,
+  `.targets`, `.sln`), read as XML rather than parsed: each project is a
+  module depending on its packages (`Name@Version`, or `Name` when the
+  version is an unexpanded `$(Property)`), project references, assembly
+  references and target frameworks; a solution depends on its projects.
+
+### Changed
+
+- tree-sitter 0.25 (from 0.24). Newer grammars, C#'s among them, are built
+  for language ABI 15, which 0.24 refused. Extraction for the existing
+  languages is unchanged on the testbed.
+
+### Measured
+
+On the testbed's C# corpus (Newtonsoft.Json, OrchardCore; 7,752 files),
+99.4% of files parse without errors, 29,062 functions, 14 duplicate ids
+(types of one name and namespace in different assemblies); ground truth 100%
+precision and recall for C# and for project files.
+
+On its T-SQL corpus (tSQLt, the First Responder Kit, Wide World Importers;
+644 files), 98.4% of files parse without errors; ground truth 100% precision
+and recall for routines, calls and table reads and writes.
+
+On PowerShell (Pester, dbatools; 2,014 files), 91.7% of files parse without
+errors, and in the rest the grammar still finds 97% of function definitions;
+ground truth 100% precision and recall.
+
+On Java (spring-petclinic, commons-lang; 759 files) 99.9% of files parse
+without errors and on Kotlin (Exposed, OkHttp; 1,671 files) 99.0%; ground
+truth 100% precision and recall for both.
+
+Every grammar dependency passes the vetting in the testbed (`vetting/`): the
+crate only compiles its parser, hand-written scanners are read, the maintainer
+and published commit are known, and the corpus parses.
+
+---
+
 ## [0.8.0] - 2026-11-10
 
 ### Changed (breaking)

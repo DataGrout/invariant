@@ -1045,3 +1045,793 @@ fn ruby_bare_calls_and_file_scoped_modules() {
         "modules are scoped by file"
     );
 }
+
+// ─── C# ──────────────────────────────────────────────────────────────────────
+
+const CSHARP_CONTROLLER: &str = r#"
+using System;
+using static System.Math;
+using Json = Newtonsoft.Json;
+
+namespace Acme.Orders;
+
+[ApiController]
+public partial class OrdersController : ControllerBase, IDisposable
+{
+    private readonly IRepo _repo;
+    public OrdersController(IRepo repo) : base(repo) { _repo = repo; }
+
+    [HttpGet("orders/{id}")]
+    public async Task<Order> Get(int id) => await _repo.Find(id);
+    public Order Get(string code) => _repo.ByCode(code);
+    internal static int Count(List<int> xs) { var t = new Tally(); return xs.Sum(x => Helper.Twice(x)); }
+
+    public string Name { get; set; }
+    public int Total => Compute(1, 2);
+    public int this[int i] { get { return Items[i]; } }
+    public event EventHandler Changed;
+    ~OrdersController() { Dispose(); }
+    public static Money operator +(Money a, Money b) => Money.Add(a, b);
+    void Local() { int Inner(int y) => y * 2; Inner(3); }
+
+    class Nested { protected virtual void Run<T>(T x) { Console.WriteLine(x); } }
+}
+
+public interface IRepo { Task<Order> Find(int id); }
+"#;
+
+fn lens_cs(code: &str, path: &str) -> Vec<String> {
+    Analyzer::new()
+        .unwrap()
+        .lens_code(code, Language::CSharp, path, "sha")
+        .unwrap()
+        .facts
+}
+
+#[test]
+fn csharp_types_are_namespace_qualified_modules() {
+    let facts = lens_cs(CSHARP_CONTROLLER, "src/Orders/OrdersController.cs");
+    assert!(has_fact(&facts, "module('acme_orders_orderscontroller', 'Acme.Orders.OrdersController', 'class:Acme.Orders.OrdersController'"));
+    assert!(has_fact(
+        &facts,
+        "module('acme_orders_orderscontroller_nested', 'Acme.Orders.OrdersController.Nested'"
+    ));
+    assert!(has_fact(
+        &facts,
+        "module('acme_orders_irepo', 'Acme.Orders.IRepo', 'interface:"
+    ));
+    assert!(has_fact(
+        &facts,
+        "depends_on('acme_orders_orderscontroller', 'ControllerBase', inherits"
+    ));
+    assert!(has_fact(
+        &facts,
+        "depends_on('src_orders_orderscontroller', 'System.Math', using"
+    ));
+    assert!(has_fact(
+        &facts,
+        "depends_on('src_orders_orderscontroller', 'Newtonsoft.Json', using"
+    ));
+}
+
+#[test]
+fn csharp_generic_and_plain_types_are_different_modules() {
+    let plain = lens_cs(
+        "namespace N { public class Result { public Result(bool ok) { } } }",
+        "Result.cs",
+    );
+    let generic = lens_cs("namespace N { public class Result<T> : Result { public Result(T value) : base(true) { } } }", "ResultOfT.cs");
+    assert!(has_fact(
+        &plain,
+        "function('n_result__result_1', 'n_result', 'Result'"
+    ));
+    assert!(has_fact(
+        &generic,
+        "module('n_result_t_', 'N.Result<T>', 'class:N.Result<T>'"
+    ));
+    assert!(has_fact(
+        &generic,
+        "function('n_result_t___result_1', 'n_result_t_', 'Result'"
+    ));
+    assert!(has_fact(
+        &generic,
+        "calls_external('n_result_t___result_1', 'unknown', 'Result'"
+    ));
+}
+
+#[test]
+fn csharp_partial_class_parts_share_one_module() {
+    let a = lens_cs(
+        "namespace N { public partial class P { public void A() { B(); } } }",
+        "a/P.cs",
+    );
+    let b = lens_cs(
+        "namespace N { public partial class P { public void B() { } } }",
+        "b/P.Part.cs",
+    );
+    assert!(has_fact(&a, "function('n_p__a_0', 'n_p', 'A'"));
+    assert!(has_fact(&b, "function('n_p__b_0', 'n_p', 'B'"));
+}
+
+#[test]
+fn csharp_members_and_visibility() {
+    let facts = lens_cs(CSHARP_CONTROLLER, "src/Orders/OrdersController.cs");
+    let id = "acme_orders_orderscontroller__";
+    assert!(has_fact(&facts, &format!("function('{id}orderscontroller_1', 'acme_orders_orderscontroller', 'OrdersController', 1, public")));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{id}count_1', 'acme_orders_orderscontroller', 'Count', 1, internal")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{id}total_0', 'acme_orders_orderscontroller', 'Total', 0, public")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{id}item_1', 'acme_orders_orderscontroller', 'Item', 1, public")
+    ));
+    assert!(has_fact(&facts, &format!("function('{id}finalize_0'")));
+    assert!(has_fact(&facts, &format!("function('{id}op_addition_2'")));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{id}local_0', 'acme_orders_orderscontroller', 'Local', 0, private")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{id}local_0__inner_1'")
+    ));
+    assert!(has_fact(&facts, "function('acme_orders_orderscontroller_nested__run_1', 'acme_orders_orderscontroller_nested', 'Run', 1, protected"));
+    assert!(has_fact(
+        &facts,
+        "function('acme_orders_irepo__find_1', 'acme_orders_irepo', 'Find', 1, public"
+    ));
+    // two Get/1 overloads are two functions
+    let gets = facts
+        .iter()
+        .filter(|f| f.starts_with("function(") && f.contains("'Get', 1"))
+        .count();
+    assert_eq!(gets, 2, "{facts:#?}");
+    // auto-properties and field-like events carry no code
+    assert!(!has_fact(&facts, "'Name', 0"));
+    assert!(!has_fact(&facts, "'Changed'"));
+}
+
+#[test]
+fn csharp_calls_attributes_and_constructor_chains() {
+    let facts = lens_cs(CSHARP_CONTROLLER, "src/Orders/OrdersController.cs");
+    let id = "acme_orders_orderscontroller__";
+    for (caller, callee) in [
+        ("get_1", "Find"),
+        ("count_1", "Tally"),
+        ("count_1", "Sum"),
+        ("count_1", "Helper.Twice"),
+        ("total_0", "Compute"),
+        ("finalize_0", "Dispose"),
+        ("op_addition_2", "Money.Add"),
+        ("local_0", "Inner"),
+        ("orderscontroller_1", "ControllerBase"),
+    ] {
+        assert!(
+            has_fact(
+                &facts,
+                &format!("calls_external('{id}{caller}', 'unknown', '{callee}'")
+            ),
+            "{caller} -> {callee}"
+        );
+    }
+    assert!(has_fact(
+        &facts,
+        "annotation('acme_orders_orderscontroller', 'ApiController', '')"
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{id}get_1', 'HttpGet', '\"orders/{{id}}\"')")
+    ));
+}
+
+#[test]
+fn csharp_top_level_statements_and_tests() {
+    let program = lens_cs(
+        "var builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddControllers();\nvar app = builder.Build();\napp.Run();\n",
+        "src/Api/Program.cs",
+    );
+    assert!(has_fact(
+        &program,
+        "function('src_api_program__main_0', 'src_api_program', 'Main', 0"
+    ));
+    assert!(has_fact(
+        &program,
+        "calls_external('src_api_program__main_0', 'unknown', 'WebApplication.CreateBuilder'"
+    ));
+    assert!(has_fact(
+        &program,
+        "calls_external('src_api_program__main_0', 'unknown', 'AddControllers'"
+    ));
+
+    let tests = lens_cs(
+        "public class OrderTests { [Fact] public void Totals() { } [Theory, InlineData(1)] public void Each(int n) { } void Helper() { } }",
+        "test/Acme.Orders.Tests/OrderTests.cs",
+    );
+    assert!(has_fact(&tests, "test('ordertests__totals_0', '', unit)"));
+    assert!(has_fact(&tests, "test('ordertests__each_1', '', unit)"));
+    assert!(has_fact(
+        &tests,
+        "test('ordertests__helper_0', '', test_helper)"
+    ));
+}
+
+#[test]
+fn msbuild_project_files_are_dependencies() {
+    let csproj = r#"<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="Polly" />
+    <PackageReference Include="NUnit" Version="$(NunitPackageVersion)" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)'=='net46'">
+    <PackageReference Include="NUnit" Version="$(NunitPackageVersion)" />
+    <ProjectReference Include="..\Acme.Core\Acme.Core.csproj" />
+  </ItemGroup>
+</Project>"#;
+    let facts = Analyzer::new()
+        .unwrap()
+        .lens_code(
+            csproj,
+            Language::MsBuild,
+            "src/Acme.Api/Acme.Api.csproj",
+            "sha",
+        )
+        .unwrap()
+        .facts;
+    let m = "src_acme_api_acme_api_csproj";
+    assert!(has_fact(
+        &facts,
+        &format!("module('{m}', 'Acme.Api.csproj'")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{m}', 'Newtonsoft.Json@13.0.3', package, 6)")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{m}', 'Polly', package")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{m}', '../Acme.Core/Acme.Core.csproj', project")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{m}', 'net8.0', target_framework")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{m}', 'net9.0', target_framework")
+    ));
+    let nunit = facts.iter().filter(|f| f.contains("'NUnit'")).count();
+    assert_eq!(nunit, 1, "one NUnit, no unexpanded version: {facts:#?}");
+
+    let sln = "Microsoft Visual Studio Solution File, Format Version 12.00\nProject(\"{FAE04EC0}\") = \"Acme.Api\", \"src\\Acme.Api\\Acme.Api.csproj\", \"{1}\"\nEndProject\n";
+    let facts = Analyzer::new()
+        .unwrap()
+        .lens_code(sln, Language::MsBuild, "Acme.sln", "sha")
+        .unwrap()
+        .facts;
+    assert!(has_fact(
+        &facts,
+        "depends_on('acme_sln', 'src/Acme.Api/Acme.Api.csproj', project, 2)"
+    ));
+}
+
+// ─── T-SQL ───────────────────────────────────────────────────────────────────
+
+fn lens_sql(code: &str, path: &str) -> Vec<String> {
+    Analyzer::new()
+        .unwrap()
+        .lens_code(code, Language::TSql, path, "sha")
+        .unwrap()
+        .facts
+}
+
+const TSQL_PROC: &str = "\u{feff}SET ANSI_NULLS ON;
+GO
+CREATE OR ALTER PROCEDURE [Sales].[CloseOrder] @OrderID int, @Note AS nvarchar(100) = NULL OUTPUT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @n int = dbo.CountLines(@OrderID);
+    IF @n = 0
+        RETURN;
+    ELSE
+        UPDATE Sales.Orders SET ClosedWhen = SYSDATETIME() WHERE OrderID = @OrderID;
+    INSERT INTO #log (id) SELECT o.OrderID FROM Sales.Orders AS o JOIN Sales.OrderLines ol ON ol.OrderID = o.OrderID;
+    SELECT * INTO #copy FROM Warehouse.Items, Warehouse.Groups g WHERE g.Id IN (1, 2);
+    DELETE FROM Sales.Holds WHERE OrderID = @OrderID;
+    BEGIN TRY
+        EXEC Audit.Record @OrderID;
+    END TRY
+    BEGIN CATCH
+        THROW;
+    END CATCH
+END;
+GO
+CREATE FUNCTION dbo.Lines(@id int) RETURNS TABLE AS RETURN SELECT * FROM Sales.OrderLines WHERE OrderID = @id;
+GO
+CREATE TABLE dbo.Audit (Id int PRIMARY KEY, Note nvarchar(max));
+GO
+";
+
+#[test]
+fn tsql_routines_are_functions_of_their_schema() {
+    let facts = lens_sql(TSQL_PROC, "db/Sales/CloseOrder.sql");
+    assert!(has_fact(&facts, "module('sales', 'Sales', 'schema:Sales'"));
+    assert!(has_fact(
+        &facts,
+        "function('sales__closeorder_2', 'sales', 'CloseOrder', 2, public"
+    ));
+    assert!(has_fact(
+        &facts,
+        "function_param('sales__closeorder_2', 1, '@Note'"
+    ));
+    assert!(has_fact(
+        &facts,
+        "annotation('sales__closeorder_2', 'procedure', '')"
+    ));
+    assert!(has_fact(
+        &facts,
+        "function('dbo__lines_1', 'dbo', 'Lines', 1, public"
+    ));
+    assert!(has_fact(
+        &facts,
+        "annotation('dbo__lines_1', 'function', '')"
+    ));
+    assert!(has_fact(
+        &facts,
+        "module('dbo__audit', 'dbo.Audit', 'table:dbo.Audit'"
+    ));
+    // SET ANSI_NULLS and the CREATE TABLE are the file's script
+    assert!(has_fact(&facts, "function('db_sales_closeorder__script_0'"));
+}
+
+#[test]
+fn tsql_calls_and_table_access() {
+    let facts = lens_sql(TSQL_PROC, "db/Sales/CloseOrder.sql");
+    let id = "sales__closeorder_2";
+    for callee in ["dbo.CountLines", "SYSDATETIME", "Audit.Record"] {
+        assert!(
+            has_fact(
+                &facts,
+                &format!("calls_external('{id}', 'unknown', '{callee}'")
+            ),
+            "{callee}"
+        );
+    }
+    for (pred, table) in [
+        ("writes_table", "Sales.Orders"),
+        ("writes_table", "#log"),
+        ("reads_table", "Sales.Orders"),
+        ("reads_table", "Sales.OrderLines"),
+        ("writes_table", "#copy"),
+        ("reads_table", "Warehouse.Items"),
+        ("reads_table", "Warehouse.Groups"),
+        ("writes_table", "Sales.Holds"),
+    ] {
+        assert!(
+            has_fact(&facts, &format!("{pred}('{id}', '{table}'")),
+            "{pred} {table}"
+        );
+    }
+    assert!(has_fact(
+        &facts,
+        "reads_table('dbo__lines_1', 'Sales.OrderLines'"
+    ));
+    // keywords, types and IN (…) are not calls; neither is the INSERT's column list
+    for not_call in ["'IN'", "'nvarchar'", "'#log'", "'max'"] {
+        assert!(
+            !facts
+                .iter()
+                .any(|f| f.starts_with("calls_external") && f.contains(not_call)),
+            "{not_call}"
+        );
+    }
+}
+
+// ─── PowerShell ──────────────────────────────────────────────────────────────
+
+const PS_SCRIPT: &str = r#"#Requires -Modules dbatools, @{ ModuleName="Pester"; ModuleVersion="5.0" }
+using module ./Fleet.psm1
+Import-Module -Name SqlServer -MinimumVersion 22.0
+. "$PSScriptRoot\private\Helpers.ps1"
+
+function Get-DbaThing {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]$SqlInstance,
+        [int]$Timeout = 30
+    )
+    $server = Connect-DbaInstance -SqlInstance $SqlInstance
+    $rows = Invoke-DbaQuery -SqlInstance $server -Query "SELECT 1" | Where-Object { Test-Row $_ }
+    $server.Databases.Refresh()
+    [System.IO.File]::ReadAllText("x")
+    function Inner { Write-Host "x" }
+    Inner
+}
+
+class Fleet : System.Object {
+    [string]$Name
+    Fleet([string]$n) { $this.Name = $n }
+    hidden [void] Start() { Start-Job -ScriptBlock { Get-Date } }
+    static [Fleet] Create() { return [Fleet]::new("x") }
+}
+
+Get-DbaThing -SqlInstance localhost
+"#;
+
+fn lens_ps(code: &str, path: &str) -> Vec<String> {
+    Analyzer::new()
+        .unwrap()
+        .lens_code(code, Language::PowerShell, path, "sha")
+        .unwrap()
+        .facts
+}
+
+#[test]
+fn powershell_functions_parameters_and_classes() {
+    let facts = lens_ps(PS_SCRIPT, "tools/Get-DbaThing.ps1");
+    let f = "tools_get_dbathing__get_dbathing_2";
+    assert!(has_fact(
+        &facts,
+        &format!("function('{f}', 'tools_get_dbathing', 'Get-DbaThing', 2, public")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function_param('{f}', 0, '$SqlInstance', 'string')")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function_param('{f}', 1, '$Timeout', 'int')")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{f}', 'CmdletBinding', '')")
+    ));
+    assert!(has_fact(&facts, &format!("function('{f}__inner_0'")));
+    let c = "tools_get_dbathing_ps1__fleet";
+    assert!(has_fact(
+        &facts,
+        &format!("module('{c}', 'Fleet', 'class:Fleet'")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{c}', 'System.Object', inherits")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{c}__fleet_1', '{c}', 'Fleet', 1, public")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{c}__start_0', '{c}', 'Start', 0, private")
+    ));
+    // top-level statements are the script
+    assert!(has_fact(
+        &facts,
+        "calls_external('tools_get_dbathing__script_0', 'unknown', 'Get-DbaThing'"
+    ));
+}
+
+#[test]
+fn powershell_calls_and_dependencies() {
+    let facts = lens_ps(PS_SCRIPT, "tools/Get-DbaThing.ps1");
+    let f = "tools_get_dbathing__get_dbathing_2";
+    for callee in [
+        "Connect-DbaInstance",
+        "Invoke-DbaQuery",
+        "Where-Object",
+        "Test-Row",
+        "Refresh",
+        "System.IO.File::ReadAllText",
+        "Inner",
+    ] {
+        assert!(
+            has_fact(
+                &facts,
+                &format!("calls_external('{f}', 'unknown', '{callee}'")
+            ),
+            "{callee}"
+        );
+    }
+    // the nested function's calls are its own
+    assert!(!has_fact(
+        &facts,
+        &format!("calls_external('{f}', 'unknown', 'Write-Host'")
+    ));
+    assert!(has_fact(
+        &facts,
+        "calls_external('tools_get_dbathing_ps1__fleet__create_0', 'unknown', 'Fleet'"
+    ));
+    let m = "tools_get_dbathing";
+    for (target, kind) in [
+        ("dbatools", "requires"),
+        ("Pester", "requires"),
+        ("./Fleet.psm1", "using"),
+        ("SqlServer", "import"),
+        ("$PSScriptRoot/private/Helpers.ps1", "dot_source"),
+    ] {
+        assert!(
+            has_fact(&facts, &format!("depends_on('{m}', '{target}', {kind}")),
+            "{target}"
+        );
+    }
+    assert!(!facts
+        .iter()
+        .any(|f| f.starts_with("calls_external") && f.contains("'using'")));
+}
+
+#[test]
+fn powershell_pester_files_are_tests() {
+    let facts = lens_ps(
+        "Describe 'Get-DbaThing' { It 'works' { Get-DbaThing | Should -Be 1 } }\nfunction New-Fixture { }\n",
+        "tests/Get-DbaThing.Tests.ps1",
+    );
+    assert!(has_fact(
+        &facts,
+        "test('tests_get_dbathing_tests__new_fixture_0', '', test_helper)"
+    ));
+}
+
+// ─── Java ────────────────────────────────────────────────────────────────────
+
+const JAVA_CONTROLLER: &str = r#"package org.acme.orders;
+
+import java.util.List;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+@RestController
+@RequestMapping("/orders")
+public class OrderController extends BaseController implements Auditable {
+    private final OrderRepository repo;
+
+    @Autowired
+    public OrderController(OrderRepository repo) { super(repo); this.repo = repo; }
+    public OrderController() { this(null); }
+
+    @GetMapping("/{id}")
+    public Order get(@PathVariable int id) { return repo.findById(id).orElseThrow(() -> new NotFound(id)); }
+    public Order get(String code) { return repo.byCode(code); }
+
+    static <T> List<T> wrap(T x) { return List.of(x); }
+
+    void schedule() {
+        Runnable r = new Runnable() { public void run() { tick(); } };
+    }
+
+    interface Hook { void run(); }
+    record Line(int qty) { int total() { return qty * 2; } }
+    enum State { OPEN, CLOSED; boolean done() { return this == CLOSED; } }
+}
+"#;
+
+fn lens_java(code: &str, path: &str) -> Vec<String> {
+    Analyzer::new()
+        .unwrap()
+        .lens_code(code, Language::Java, path, "sha")
+        .unwrap()
+        .facts
+}
+
+#[test]
+fn java_types_members_and_annotations() {
+    let facts = lens_java(
+        JAVA_CONTROLLER,
+        "src/main/java/org/acme/orders/OrderController.java",
+    );
+    let t = "org_acme_orders_ordercontroller";
+    assert!(has_fact(&facts, &format!("module('{t}', 'org.acme.orders.OrderController', 'class:org.acme.orders.OrderController'")));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{t}', 'BaseController', inherits")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{t}', 'Auditable', inherits")
+    ));
+    assert!(has_fact(
+        &facts,
+        "depends_on('src_main_java_org_acme_orders_ordercontroller', 'java.util.List', import"
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{t}', 'RequestMapping', '\"/orders\"')")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{t}__get_1', 'GetMapping', '\"/{{id}}\"')")
+    ));
+    let gets = facts
+        .iter()
+        .filter(|f| f.starts_with("function(") && f.contains("'get', 1"))
+        .count();
+    assert_eq!(gets, 2, "two get/1 overloads");
+    assert!(has_fact(
+        &facts,
+        &format!("function('{t}__wrap_1', '{t}', 'wrap', 1, package")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("module('{t}_line', 'org.acme.orders.OrderController.Line', 'record:")
+    ));
+    assert!(has_fact(&facts, &format!("function('{t}_state__done_0'")));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{t}_hook__run_0', '{t}_hook', 'run', 0, public")
+    ));
+}
+
+#[test]
+fn java_calls() {
+    let facts = lens_java(
+        JAVA_CONTROLLER,
+        "src/main/java/org/acme/orders/OrderController.java",
+    );
+    let t = "org_acme_orders_ordercontroller";
+    for (caller, callee) in [
+        ("ordercontroller_1", "BaseController"),
+        ("ordercontroller_0", "OrderController"),
+        ("get_1", "findById"),
+        ("get_1", "orElseThrow"),
+        ("get_1", "NotFound"),
+        ("wrap_1", "List.of"),
+        ("schedule_0", "Runnable"),
+    ] {
+        assert!(
+            has_fact(
+                &facts,
+                &format!("calls_external('{t}__{caller}', 'unknown', '{callee}'")
+            ),
+            "{caller} -> {callee}"
+        );
+    }
+    // the anonymous class's method is its own function
+    assert!(facts
+        .iter()
+        .any(|f| f.starts_with("function(") && f.contains("'run', 0") && f.contains("anon_l")));
+    assert!(!has_fact(
+        &facts,
+        &format!("calls_external('{t}__schedule_0', 'unknown', 'tick'")
+    ));
+}
+
+#[test]
+fn java_tests_by_annotation() {
+    let facts = lens_java(
+        "class OrderTest { @Test void totals() { } @ParameterizedTest void each(int n) { } void helper() { } }",
+        "src/test/java/OrderTest.java",
+    );
+    assert!(has_fact(&facts, "test('ordertest__totals_0', '', unit)"));
+    assert!(has_fact(&facts, "test('ordertest__each_1', '', unit)"));
+    assert!(has_fact(
+        &facts,
+        "test('ordertest__helper_0', '', test_helper)"
+    ));
+}
+
+// ─── Kotlin ──────────────────────────────────────────────────────────────────
+
+const KOTLIN_SERVICE: &str = r#"package org.acme.orders
+
+import kotlinx.coroutines.launch
+import org.acme.db.*
+
+@Service
+class OrderService(private val repo: OrderRepository) : BaseService(), Auditable {
+    fun get(id: Int): Order = repo.findById(id) ?: throw NotFound(id)
+    internal suspend fun close(id: Int, note: String = "") { repo.update(id) { closed = true }; Audit.record(id) }
+    val total: Int get() = compute(1)
+    constructor(name: String) : this(Repo(name))
+    companion object { fun create(): OrderService = OrderService(Repo()) }
+}
+
+fun String.shout(): String = uppercase()
+private fun helper(x: Int) = listOf(x).map { it * 2 }
+
+interface Auditable { fun audit() }
+"#;
+
+fn lens_kt(code: &str, path: &str) -> Vec<String> {
+    Analyzer::new()
+        .unwrap()
+        .lens_code(code, Language::Kotlin, path, "sha")
+        .unwrap()
+        .facts
+}
+
+#[test]
+fn kotlin_classes_objects_and_functions() {
+    let facts = lens_kt(KOTLIN_SERVICE, "src/main/kotlin/OrderService.kt");
+    let t = "org_acme_orders_orderservice";
+    assert!(has_fact(
+        &facts,
+        &format!("module('{t}', 'org.acme.orders.OrderService', 'class:")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{t}', 'BaseService', inherits")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{t}', 'Service', '')")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{t}__orderservice_1', '{t}', 'OrderService', 1, public")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{t}__close_2', '{t}', 'close', 2, internal")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function_param('{t}__close_2', 1, 'note', 'String')")
+    ));
+    assert!(has_fact(&facts, &format!("function('{t}__total_0'")));
+    assert!(has_fact(
+        &facts,
+        &format!("module('{t}_companion', 'org.acme.orders.OrderService.Companion', 'object:")
+    ));
+    assert!(has_fact(
+        &facts,
+        "module('org_acme_orders_auditable', 'org.acme.orders.Auditable', 'interface:"
+    ));
+    let f = "src_main_kotlin_orderservice";
+    assert!(has_fact(
+        &facts,
+        &format!("function('{f}__shout_0', '{f}', 'shout', 0, public")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{f}__shout_0', 'receiver', 'String')")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{f}__helper_1', '{f}', 'helper', 1, private")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{f}', 'org.acme.db.*', import")
+    ));
+}
+
+#[test]
+fn kotlin_calls() {
+    let facts = lens_kt(KOTLIN_SERVICE, "src/main/kotlin/OrderService.kt");
+    let t = "org_acme_orders_orderservice";
+    for (caller, callee) in [
+        ("get_1", "findById"),
+        ("get_1", "NotFound"),
+        ("close_2", "update"),
+        ("close_2", "Audit.record"),
+        ("total_0", "compute"),
+    ] {
+        assert!(
+            has_fact(
+                &facts,
+                &format!("calls_external('{t}__{caller}', 'unknown', '{callee}'")
+            ),
+            "{caller} -> {callee}"
+        );
+    }
+    assert!(has_fact(
+        &facts,
+        &format!("calls_external('{t}_companion__create_0', 'unknown', 'OrderService'")
+    ));
+    assert!(has_fact(
+        &facts,
+        "calls_external('src_main_kotlin_orderservice__helper_1', 'unknown', 'listOf'"
+    ));
+}
