@@ -249,10 +249,29 @@ impl Bridge {
         commit_sha: Option<&str>,
         namespace: Option<&str>,
     ) -> Result<serde_json::Value> {
+        self.query_filtered(repo_id, query, commit_sha, namespace, None)
+            .await
+    }
+
+    /// As [`Bridge::query`], keeping only the rows that mention `filter`
+    /// (case-insensitive): a table for `table_access`, a package for
+    /// `dependencies`, an annotation or a path for `routes`.
+    pub async fn query_filtered(
+        &self,
+        repo_id: &str,
+        query: &str,
+        commit_sha: Option<&str>,
+        namespace: Option<&str>,
+        filter: Option<&str>,
+    ) -> Result<serde_json::Value> {
         let mut args = json!({
             "repo_id": repo_id,
             "query": query,
         });
+
+        if let Some(f) = filter {
+            args["filter"] = json!(f);
+        }
 
         if let Some(sha) = commit_sha {
             args["commit_sha"] = json!(sha);

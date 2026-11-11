@@ -136,6 +136,10 @@ invariant query security_concerns   # Potential security issues
 invariant query hotspots             # High-complexity, high-change-rate functions
 invariant query summary              # Aggregate statistics
 invariant query orphans --namespace my_ns   # Query a namespace other than the one lens last wrote
+invariant query table_access --filter Sales.Orders   # Which procedures read and write a table (T-SQL)
+invariant query routes               # HTTP routes from ASP.NET and Spring, with their auth annotations
+invariant query annotations --filter Authorize       # Everything carrying an annotation
+invariant query dependencies --filter Newtonsoft.Json # What depends on a package
 ```
 
 ### `invariant diff`
