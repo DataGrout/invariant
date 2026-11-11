@@ -87,9 +87,6 @@ Every grammar dependency passes the vetting in the testbed (`vetting/`): the
 crate only compiles its parser, hand-written scanners are read, the maintainer
 and published commit are known, and the corpus parses.
 
-`tree-sitter-tsql` must be published to crates.io before this release: the
-workspace points at it by path for development.
-
 ---
 
 ## [0.8.0] - 2026-11-10
