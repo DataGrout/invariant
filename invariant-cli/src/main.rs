@@ -54,7 +54,7 @@ enum Commands {
         #[arg(long)]
         local_only: bool,
 
-        /// Logic-cell namespace for the facts (default: code_<repo>)
+        /// Logic-cell namespace for the facts (default: `code_<repo>`)
         #[arg(long)]
         namespace: Option<String>,
 
