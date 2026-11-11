@@ -18,7 +18,7 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # Parsing
-tree-sitter = "0.24"
+tree-sitter = "0.25"
 tree-sitter-rust = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-typescript = "0.23"
@@ -29,6 +29,9 @@ tree-sitter-ruby = "0.23"
 tree-sitter-php = "0.23"
 # MIT Prolog grammar — published from the sibling tree-sitter-grammars repo.
 tree-sitter-prolog = "0.1"
+tree-sitter-c-sharp = "0.23"
+# .NET project files (.csproj, Directory.Packages.props): XML, no grammar.
+quick-xml = "0.37"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

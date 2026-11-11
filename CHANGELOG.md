@@ -6,6 +6,44 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **C#** (`.cs`, `.csx`). A type's module id is its namespace-qualified name
+  with its type parameters (`Acme.Orders.Result<T>`), so the parts of a
+  partial class across files are one module and `Result` and `Result<T>` are
+  two. Methods, constructors (named for the type, which is what `new T()`
+  calls), finalizers, operators (`op_Addition`), properties and indexers with
+  bodies, event accessors, local functions and top-level statements (the
+  file's `Main`) are functions; auto-properties carry no code and are left
+  out. Accessibility follows C#'s defaults, `internal` included. `using`
+  directives and base types are dependencies; `: base(…)` calls the base
+  class's constructor. `[Fact]`, `[Theory]`, `[Test]`, `[TestMethod]` and
+  `[TestCase]` mark tests, as do `*.Tests` project directories.
+- **`annotation(Id, Name, Args)`** for C# attributes on types and members, so
+  `[HttpGet("orders/{id}")]` routes and `[Authorize]` can be queried.
+- **.NET project files** (`.csproj`, `.fsproj`, `.vbproj`, `.props`,
+  `.targets`, `.sln`), read as XML rather than parsed: each project is a
+  module depending on its packages (`Name@Version`, or `Name` when the
+  version is an unexpanded `$(Property)`), project references, assembly
+  references and target frameworks; a solution depends on its projects.
+
+### Changed
+
+- tree-sitter 0.25 (from 0.24). Newer grammars, C#'s among them, are built
+  for language ABI 15, which 0.24 refused. Extraction for the existing
+  languages is unchanged on the testbed.
+
+### Measured
+
+On the testbed's C# corpus (Newtonsoft.Json, OrchardCore; 7,752 files),
+99.4% of files parse without errors, 29,062 functions, 14 duplicate ids
+(types of one name and namespace in different assemblies); ground truth 100%
+precision and recall for C# and for project files.
+
+---
+
 ## [0.8.0] - 2026-11-10
 
 ### Changed (breaking)

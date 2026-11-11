@@ -189,6 +189,8 @@ Show connection, identity, and configuration status.
 | Ruby       | tree-sitter| `.rb`, `.rake`, `.gemspec` |
 | PHP        | tree-sitter| `.php`, `.phtml` |
 | Prolog     | tree-sitter| `.pl`, `.plt`, `.pro`, `.prolog` |
+| C#         | tree-sitter| `.cs`, `.csx`    |
+| .NET projects | XML     | `.csproj`, `.fsproj`, `.vbproj`, `.props`, `.targets`, `.sln` |
 
 ## Architecture
 

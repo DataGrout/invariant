@@ -1045,3 +1045,283 @@ fn ruby_bare_calls_and_file_scoped_modules() {
         "modules are scoped by file"
     );
 }
+
+// ─── C# ──────────────────────────────────────────────────────────────────────
+
+const CSHARP_CONTROLLER: &str = r#"
+using System;
+using static System.Math;
+using Json = Newtonsoft.Json;
+
+namespace Acme.Orders;
+
+[ApiController]
+public partial class OrdersController : ControllerBase, IDisposable
+{
+    private readonly IRepo _repo;
+    public OrdersController(IRepo repo) : base(repo) { _repo = repo; }
+
+    [HttpGet("orders/{id}")]
+    public async Task<Order> Get(int id) => await _repo.Find(id);
+    public Order Get(string code) => _repo.ByCode(code);
+    internal static int Count(List<int> xs) { var t = new Tally(); return xs.Sum(x => Helper.Twice(x)); }
+
+    public string Name { get; set; }
+    public int Total => Compute(1, 2);
+    public int this[int i] { get { return Items[i]; } }
+    public event EventHandler Changed;
+    ~OrdersController() { Dispose(); }
+    public static Money operator +(Money a, Money b) => Money.Add(a, b);
+    void Local() { int Inner(int y) => y * 2; Inner(3); }
+
+    class Nested { protected virtual void Run<T>(T x) { Console.WriteLine(x); } }
+}
+
+public interface IRepo { Task<Order> Find(int id); }
+"#;
+
+fn lens_cs(code: &str, path: &str) -> Vec<String> {
+    Analyzer::new()
+        .unwrap()
+        .lens_code(code, Language::CSharp, path, "sha")
+        .unwrap()
+        .facts
+}
+
+#[test]
+fn csharp_types_are_namespace_qualified_modules() {
+    let facts = lens_cs(CSHARP_CONTROLLER, "src/Orders/OrdersController.cs");
+    assert!(has_fact(&facts, "module('acme_orders_orderscontroller', 'Acme.Orders.OrdersController', 'class:Acme.Orders.OrdersController'"));
+    assert!(has_fact(
+        &facts,
+        "module('acme_orders_orderscontroller_nested', 'Acme.Orders.OrdersController.Nested'"
+    ));
+    assert!(has_fact(
+        &facts,
+        "module('acme_orders_irepo', 'Acme.Orders.IRepo', 'interface:"
+    ));
+    assert!(has_fact(
+        &facts,
+        "depends_on('acme_orders_orderscontroller', 'ControllerBase', inherits"
+    ));
+    assert!(has_fact(
+        &facts,
+        "depends_on('src_orders_orderscontroller', 'System.Math', using"
+    ));
+    assert!(has_fact(
+        &facts,
+        "depends_on('src_orders_orderscontroller', 'Newtonsoft.Json', using"
+    ));
+}
+
+#[test]
+fn csharp_generic_and_plain_types_are_different_modules() {
+    let plain = lens_cs(
+        "namespace N { public class Result { public Result(bool ok) { } } }",
+        "Result.cs",
+    );
+    let generic = lens_cs("namespace N { public class Result<T> : Result { public Result(T value) : base(true) { } } }", "ResultOfT.cs");
+    assert!(has_fact(
+        &plain,
+        "function('n_result__result_1', 'n_result', 'Result'"
+    ));
+    assert!(has_fact(
+        &generic,
+        "module('n_result_t_', 'N.Result<T>', 'class:N.Result<T>'"
+    ));
+    assert!(has_fact(
+        &generic,
+        "function('n_result_t___result_1', 'n_result_t_', 'Result'"
+    ));
+    assert!(has_fact(
+        &generic,
+        "calls_external('n_result_t___result_1', 'unknown', 'Result'"
+    ));
+}
+
+#[test]
+fn csharp_partial_class_parts_share_one_module() {
+    let a = lens_cs(
+        "namespace N { public partial class P { public void A() { B(); } } }",
+        "a/P.cs",
+    );
+    let b = lens_cs(
+        "namespace N { public partial class P { public void B() { } } }",
+        "b/P.Part.cs",
+    );
+    assert!(has_fact(&a, "function('n_p__a_0', 'n_p', 'A'"));
+    assert!(has_fact(&b, "function('n_p__b_0', 'n_p', 'B'"));
+}
+
+#[test]
+fn csharp_members_and_visibility() {
+    let facts = lens_cs(CSHARP_CONTROLLER, "src/Orders/OrdersController.cs");
+    let id = "acme_orders_orderscontroller__";
+    assert!(has_fact(&facts, &format!("function('{id}orderscontroller_1', 'acme_orders_orderscontroller', 'OrdersController', 1, public")));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{id}count_1', 'acme_orders_orderscontroller', 'Count', 1, internal")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{id}total_0', 'acme_orders_orderscontroller', 'Total', 0, public")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{id}item_1', 'acme_orders_orderscontroller', 'Item', 1, public")
+    ));
+    assert!(has_fact(&facts, &format!("function('{id}finalize_0'")));
+    assert!(has_fact(&facts, &format!("function('{id}op_addition_2'")));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{id}local_0', 'acme_orders_orderscontroller', 'Local', 0, private")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{id}local_0__inner_1'")
+    ));
+    assert!(has_fact(&facts, "function('acme_orders_orderscontroller_nested__run_1', 'acme_orders_orderscontroller_nested', 'Run', 1, protected"));
+    assert!(has_fact(
+        &facts,
+        "function('acme_orders_irepo__find_1', 'acme_orders_irepo', 'Find', 1, public"
+    ));
+    // two Get/1 overloads are two functions
+    let gets = facts
+        .iter()
+        .filter(|f| f.starts_with("function(") && f.contains("'Get', 1"))
+        .count();
+    assert_eq!(gets, 2, "{facts:#?}");
+    // auto-properties and field-like events carry no code
+    assert!(!has_fact(&facts, "'Name', 0"));
+    assert!(!has_fact(&facts, "'Changed'"));
+}
+
+#[test]
+fn csharp_calls_attributes_and_constructor_chains() {
+    let facts = lens_cs(CSHARP_CONTROLLER, "src/Orders/OrdersController.cs");
+    let id = "acme_orders_orderscontroller__";
+    for (caller, callee) in [
+        ("get_1", "Find"),
+        ("count_1", "Tally"),
+        ("count_1", "Sum"),
+        ("count_1", "Helper.Twice"),
+        ("total_0", "Compute"),
+        ("finalize_0", "Dispose"),
+        ("op_addition_2", "Money.Add"),
+        ("local_0", "Inner"),
+        ("orderscontroller_1", "ControllerBase"),
+    ] {
+        assert!(
+            has_fact(
+                &facts,
+                &format!("calls_external('{id}{caller}', 'unknown', '{callee}'")
+            ),
+            "{caller} -> {callee}"
+        );
+    }
+    assert!(has_fact(
+        &facts,
+        "annotation('acme_orders_orderscontroller', 'ApiController', '')"
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{id}get_1', 'HttpGet', '\"orders/{{id}}\"')")
+    ));
+}
+
+#[test]
+fn csharp_top_level_statements_and_tests() {
+    let program = lens_cs(
+        "var builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddControllers();\nvar app = builder.Build();\napp.Run();\n",
+        "src/Api/Program.cs",
+    );
+    assert!(has_fact(
+        &program,
+        "function('src_api_program__main_0', 'src_api_program', 'Main', 0"
+    ));
+    assert!(has_fact(
+        &program,
+        "calls_external('src_api_program__main_0', 'unknown', 'WebApplication.CreateBuilder'"
+    ));
+    assert!(has_fact(
+        &program,
+        "calls_external('src_api_program__main_0', 'unknown', 'AddControllers'"
+    ));
+
+    let tests = lens_cs(
+        "public class OrderTests { [Fact] public void Totals() { } [Theory, InlineData(1)] public void Each(int n) { } void Helper() { } }",
+        "test/Acme.Orders.Tests/OrderTests.cs",
+    );
+    assert!(has_fact(&tests, "test('ordertests__totals_0', '', unit)"));
+    assert!(has_fact(&tests, "test('ordertests__each_1', '', unit)"));
+    assert!(has_fact(
+        &tests,
+        "test('ordertests__helper_0', '', test_helper)"
+    ));
+}
+
+#[test]
+fn msbuild_project_files_are_dependencies() {
+    let csproj = r#"<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="Polly" />
+    <PackageReference Include="NUnit" Version="$(NunitPackageVersion)" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)'=='net46'">
+    <PackageReference Include="NUnit" Version="$(NunitPackageVersion)" />
+    <ProjectReference Include="..\Acme.Core\Acme.Core.csproj" />
+  </ItemGroup>
+</Project>"#;
+    let facts = Analyzer::new()
+        .unwrap()
+        .lens_code(
+            csproj,
+            Language::MsBuild,
+            "src/Acme.Api/Acme.Api.csproj",
+            "sha",
+        )
+        .unwrap()
+        .facts;
+    let m = "src_acme_api_acme_api_csproj";
+    assert!(has_fact(
+        &facts,
+        &format!("module('{m}', 'Acme.Api.csproj'")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{m}', 'Newtonsoft.Json@13.0.3', package, 6)")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{m}', 'Polly', package")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{m}', '../Acme.Core/Acme.Core.csproj', project")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{m}', 'net8.0', target_framework")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{m}', 'net9.0', target_framework")
+    ));
+    let nunit = facts.iter().filter(|f| f.contains("'NUnit'")).count();
+    assert_eq!(nunit, 1, "one NUnit, no unexpanded version: {facts:#?}");
+
+    let sln = "Microsoft Visual Studio Solution File, Format Version 12.00\nProject(\"{FAE04EC0}\") = \"Acme.Api\", \"src\\Acme.Api\\Acme.Api.csproj\", \"{1}\"\nEndProject\n";
+    let facts = Analyzer::new()
+        .unwrap()
+        .lens_code(sln, Language::MsBuild, "Acme.sln", "sha")
+        .unwrap()
+        .facts;
+    assert!(has_fact(
+        &facts,
+        "depends_on('acme_sln', 'src/Acme.Api/Acme.Api.csproj', project, 2)"
+    ));
+}

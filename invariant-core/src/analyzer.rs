@@ -58,11 +58,31 @@ impl Analyzer {
         filepath: &str,
         commit_sha: &str,
     ) -> Result<AnalysisResult> {
-        let tree = self.parser.parse(code, language)?;
-        let root = tree.root_node();
-
         let mut facts = Vec::new();
         let mut summary = AnalysisSummary::default();
+
+        // Project files are XML or plain text: nothing for tree-sitter to read.
+        if language == Language::MsBuild {
+            let ctx = &mut Ctx {
+                code: code.as_bytes(),
+                filepath,
+                commit_sha,
+                facts: &mut facts,
+                summary: &mut summary,
+                seen_functions: std::collections::HashSet::new(),
+                taken_ids: std::collections::HashSet::new(),
+            };
+            analyze_msbuild(code, ctx);
+            summary.loc = code.lines().count();
+            return Ok(AnalysisResult {
+                facts: facts.iter().map(|f| f.to_prolog()).collect(),
+                summary,
+                receipt: None,
+            });
+        }
+
+        let tree = self.parser.parse(code, language)?;
+        let root = tree.root_node();
 
         let ctx = &mut Ctx {
             code: code.as_bytes(),
@@ -85,6 +105,8 @@ impl Analyzer {
             Language::Ruby => analyze_ruby(&root, ctx)?,
             Language::Php => analyze_php(&root, ctx)?,
             Language::Prolog => analyze_prolog(&root, ctx)?,
+            Language::CSharp => analyze_csharp(&root, ctx)?,
+            Language::MsBuild => unreachable!("handled above"),
         }
 
         summary.loc = code.lines().count();
@@ -216,6 +238,36 @@ fn test_kind(filepath: &str, name: &str, fn_node: &Node<'_>, code: &[u8]) -> Opt
 /// Rust's `#[test]`, `#[tokio::test]`, `#[rstest]` and the like, on the
 /// attribute items just before the function.
 fn has_test_attribute(fn_node: &Node<'_>, code: &[u8]) -> bool {
+    // C#: [Fact], [Theory], [Test], [TestMethod], [TestCase(...)] … are
+    // attribute lists inside the method declaration.
+    let mut cursor = fn_node.walk();
+    for list in fn_node.children(&mut cursor) {
+        if list.kind() != "attribute_list" {
+            continue;
+        }
+        let mut lc = list.walk();
+        for attr in list.named_children(&mut lc) {
+            let name = attr
+                .child_by_field_name("name")
+                .map(|n| node_text(&n, code))
+                .unwrap_or("");
+            let short = name.rsplit('.').next().unwrap_or(name);
+            let short = short.strip_suffix("Attribute").unwrap_or(short);
+            if matches!(
+                short,
+                "Fact"
+                    | "Theory"
+                    | "Test"
+                    | "TestMethod"
+                    | "DataTestMethod"
+                    | "TestCase"
+                    | "TestCaseSource"
+            ) {
+                return true;
+            }
+        }
+    }
+
     let mut prev = fn_node.prev_named_sibling();
     while let Some(node) = prev {
         if node.kind() != "attribute_item" {
@@ -236,13 +288,18 @@ pub(crate) fn is_test_file(filepath: &str) -> bool {
     let segments: Vec<&str> = path.split('/').collect();
     let file = segments.last().copied().unwrap_or("");
 
+    // .NET test projects are directories named like `Foo.Tests`,
+    // `Foo.UnitTests` or `Foo.Test`.
     let in_test_dir = segments[..segments.len().saturating_sub(1)]
         .iter()
         .any(|s| {
             matches!(
                 *s,
                 "test" | "tests" | "spec" | "specs" | "__tests__" | "testing"
-            )
+            ) || s.ends_with(".Tests")
+                || s.ends_with(".Test")
+                || s.ends_with("UnitTests")
+                || s.ends_with("IntegrationTests")
         });
 
     let stem = file.split('.').next().unwrap_or(file);
@@ -2034,6 +2091,596 @@ fn analyze_php_calls(
     }
 
     Ok(())
+}
+
+// ========================================================================
+// C# Analysis
+// ========================================================================
+//
+// A type's module id is its namespace-qualified name, not its file, so the
+// parts of a partial class written across files are one module. Members are
+// functions: methods, constructors (named for the type, which is what
+// `new T()` calls), finalizers, operators, properties and indexers with
+// bodies, event accessors and local functions. Auto-properties carry no code
+// and are left out. Top-level statements are the file's `Main`. Attributes
+// become `annotation(Id, Name, Args)`, so `[HttpGet("orders/{id}")]` routes
+// can be found.
+
+const CSHARP_TYPES: &[&str] = &[
+    "class_declaration",
+    "struct_declaration",
+    "interface_declaration",
+    "record_declaration",
+    "record_struct_declaration",
+    "enum_declaration",
+    "delegate_declaration",
+];
+
+fn analyze_csharp(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let (file_id, file_name) = module_id_from_path(ctx.filepath, ".cs", ".");
+    emit_module(ctx, &file_id, &file_name, ctx.filepath, 1);
+    let mut main: Option<String> = None;
+    analyze_csharp_scope(root, &file_id, "", &mut main, ctx)
+}
+
+fn dotted(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}.{}", prefix, name)
+    }
+}
+
+/// The declarations of a compilation unit or namespace body. `ns` is the
+/// enclosing namespace; a file-scoped namespace applies to the rest of the
+/// file.
+fn analyze_csharp_scope(
+    node: &Node<'_>,
+    file_id: &str,
+    ns: &str,
+    main: &mut Option<String>,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
+    let mut ns = ns.to_string();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "using_directive" => csharp_using(&child, file_id, ctx),
+            "file_scoped_namespace_declaration" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    ns = node_text(&name, ctx.code).to_string();
+                }
+            }
+            "namespace_declaration" => {
+                let name = child
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, ctx.code).to_string())
+                    .unwrap_or_default();
+                if let Some(body) = child.child_by_field_name("body") {
+                    analyze_csharp_scope(&body, file_id, &dotted(&ns, &name), main, ctx)?;
+                }
+            }
+            "global_statement" => {
+                // C# 9 top-level statements: the program's entry point.
+                let id = main
+                    .get_or_insert_with(|| {
+                        let id = scoped_id(file_id, "Main_0");
+                        emit_function(
+                            ctx,
+                            &id,
+                            file_id,
+                            "Main",
+                            0,
+                            "public",
+                            node_line(&child),
+                            &child,
+                        );
+                        id
+                    })
+                    .clone();
+                analyze_csharp_calls(&child, &id, file_id, ctx)?;
+            }
+            k if CSHARP_TYPES.contains(&k) => analyze_csharp_type(&child, &ns, ctx)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `using A.B;`, `using static A.B;`, `global using A;`, `using X = A.B;`:
+/// a dependency of the file on the namespace or type named.
+fn csharp_using(node: &Node<'_>, file_id: &str, ctx: &mut Ctx<'_>) {
+    let alias = node.child_by_field_name("name").map(|n| n.id());
+    let mut cursor = node.walk();
+    let target = node
+        .named_children(&mut cursor)
+        .filter(|c| Some(c.id()) != alias)
+        .find(|c| {
+            matches!(
+                c.kind(),
+                "identifier" | "qualified_name" | "generic_name" | "alias_qualified_name"
+            )
+        });
+    if let Some(t) = target {
+        let text = node_text(&t, ctx.code).to_string();
+        emit_dependency(ctx, file_id, &text, "using", node_line(node));
+    }
+}
+
+/// A type's name without type arguments: `Repo<T>` → `Repo`, `A.B<T>` → `A.B`.
+fn csharp_type_name(node: &Node<'_>, code: &[u8]) -> String {
+    let text = node_text(node, code);
+    let text = text.split('<').next().unwrap_or(text);
+    text.split_whitespace().collect::<Vec<_>>().join("")
+}
+
+fn csharp_modifiers(node: &Node<'_>, code: &[u8]) -> Vec<String> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|c| c.kind() == "modifier")
+        .map(|c| node_text(&c, code).to_string())
+        .collect()
+}
+
+/// C#'s accessibility, with the language's defaults: members of a class or
+/// struct are private, of an interface public. `protected internal` and
+/// `private protected` read as protected.
+fn csharp_visibility(modifiers: &[String], in_interface: bool) -> &'static str {
+    let has = |m: &str| modifiers.iter().any(|x| x == m);
+    if has("public") {
+        "public"
+    } else if has("protected") {
+        "protected"
+    } else if has("internal") {
+        "internal"
+    } else if has("private") {
+        "private"
+    } else if in_interface {
+        "public"
+    } else {
+        "private"
+    }
+}
+
+/// `annotation(Id, Name, Args)` for each attribute on `node`.
+fn csharp_annotations(node: &Node<'_>, id: &str, ctx: &mut Ctx<'_>) {
+    let mut cursor = node.walk();
+    let lists: Vec<Node<'_>> = node
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "attribute_list")
+        .collect();
+    for list in lists {
+        let mut lc = list.walk();
+        let attrs: Vec<Node<'_>> = list
+            .named_children(&mut lc)
+            .filter(|a| a.kind() == "attribute")
+            .collect();
+        for attr in attrs {
+            let name = attr
+                .child_by_field_name("name")
+                .map(|n| csharp_type_name(&n, ctx.code))
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let args = find_child_by_kind(&attr, "attribute_argument_list")
+                .map(|a| {
+                    let t = node_text(&a, ctx.code);
+                    clean_param(t.trim_start_matches('(').trim_end_matches(')'))
+                })
+                .unwrap_or_default();
+            ctx.facts.push(Fact::new(
+                "annotation",
+                vec![
+                    FactValue::String(id.to_string()),
+                    FactValue::String(name),
+                    FactValue::String(args),
+                ],
+            ));
+        }
+    }
+}
+
+fn analyze_csharp_type(node: &Node<'_>, outer: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(&n, ctx.code).to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    // `Result` and `Result<T>` are different types: the type parameters are
+    // part of the module's name and id.
+    let generic = node
+        .child_by_field_name("type_parameters")
+        .or_else(|| find_child_by_kind(node, "type_parameter_list"))
+        .map(|tp| {
+            let mut c = tp.walk();
+            let names: Vec<String> = tp
+                .named_children(&mut c)
+                .filter(|p| p.kind() == "type_parameter")
+                .filter_map(|p| {
+                    p.child_by_field_name("name")
+                        .map(|n| node_text(&n, ctx.code).to_string())
+                        .or_else(|| first_identifier_text(&p, ctx.code))
+                })
+                .collect();
+            format!("<{}>", names.join(","))
+        })
+        .unwrap_or_default();
+    let qualified = dotted(outer, &format!("{}{}", name, generic));
+    let type_id = normalize_id(&qualified);
+    let label = node.kind().trim_end_matches("_declaration");
+    emit_module(
+        ctx,
+        &type_id,
+        &qualified,
+        &format!("{}:{}", label, qualified),
+        node_line(node),
+    );
+    csharp_annotations(node, &type_id, ctx);
+
+    // A class's base class is listed first; `: base(…)` calls its constructor.
+    let mut first_base: Option<String> = None;
+    if let Some(bases) = find_child_by_kind(node, "base_list") {
+        let mut cursor = bases.walk();
+        let names: Vec<(String, usize)> = bases
+            .named_children(&mut cursor)
+            .filter(|b| {
+                matches!(
+                    b.kind(),
+                    "identifier"
+                        | "qualified_name"
+                        | "generic_name"
+                        | "primary_constructor_base_type"
+                )
+            })
+            .map(|b| {
+                let n = if b.kind() == "primary_constructor_base_type" {
+                    b.child_by_field_name("type").unwrap_or(b)
+                } else {
+                    b
+                };
+                (csharp_type_name(&n, ctx.code), node_line(&b))
+            })
+            .collect();
+        for (base, line) in &names {
+            emit_dependency(ctx, &type_id, base, "inherits", *line);
+        }
+        first_base = names.first().map(|(b, _)| b.clone());
+    }
+
+    let in_interface = node.kind() == "interface_declaration";
+    let Some(body) = node.child_by_field_name("body") else {
+        return Ok(());
+    };
+    let mut cursor = body.walk();
+    let members: Vec<Node<'_>> = body.named_children(&mut cursor).collect();
+    for member in members {
+        let kind = member.kind();
+        if CSHARP_TYPES.contains(&kind) {
+            analyze_csharp_type(&member, &qualified, ctx)?;
+            continue;
+        }
+        let member_name = || {
+            member
+                .child_by_field_name("name")
+                .map(|n| node_text(&n, ctx.code).to_string())
+        };
+        // (name, arity, the nodes whose code belongs to the member)
+        let (fname, arity): (String, usize) = match kind {
+            "method_declaration" => (
+                member_name().unwrap_or_else(|| "unknown".into()),
+                param_count(&member, "parameters"),
+            ),
+            "constructor_declaration" => (name.clone(), param_count(&member, "parameters")),
+            "destructor_declaration" => ("Finalize".into(), 0),
+            "operator_declaration" => {
+                let op = member
+                    .child_by_field_name("operator")
+                    .map(|n| node_text(&n, ctx.code).to_string())
+                    .unwrap_or_default();
+                (
+                    csharp_operator_name(&op),
+                    param_count(&member, "parameters"),
+                )
+            }
+            "conversion_operator_declaration" => {
+                let text = node_text(&member, ctx.code);
+                let which = if text.contains("explicit") {
+                    "op_Explicit"
+                } else {
+                    "op_Implicit"
+                };
+                (which.into(), param_count(&member, "parameters"))
+            }
+            "property_declaration" | "event_declaration" => {
+                if !csharp_has_code(&member) {
+                    continue;
+                }
+                (member_name().unwrap_or_else(|| "unknown".into()), 0)
+            }
+            "indexer_declaration" => {
+                if !csharp_has_code(&member) {
+                    continue;
+                }
+                ("Item".into(), param_count(&member, "parameters"))
+            }
+            _ => continue,
+        };
+
+        let line = node_line(&member);
+        let func_id = ctx.unique_id(scoped_id(&type_id, &format!("{}_{}", fname, arity)), line);
+        let visibility = csharp_visibility(&csharp_modifiers(&member, ctx.code), in_interface);
+        emit_function(
+            ctx, &func_id, &type_id, &fname, arity, visibility, line, &member,
+        );
+        csharp_annotations(&member, &func_id, ctx);
+
+        for field in ["body", "value", "accessors"] {
+            if let Some(code) = member.child_by_field_name(field) {
+                analyze_csharp_calls(&code, &func_id, &type_id, ctx)?;
+            }
+        }
+        // `: base(x)` calls the base class's constructor, `: this(x)` another
+        // of this type's.
+        if let Some(init) = find_child_by_kind(&member, "constructor_initializer") {
+            let text = node_text(&init, ctx.code);
+            let to_base = text
+                .trim_start_matches(':')
+                .trim_start()
+                .starts_with("base");
+            let target = match (&first_base, to_base) {
+                (Some(b), true) => b.rsplit('.').next().unwrap_or(b).to_string(),
+                (None, true) => "base".to_string(),
+                (_, false) => name.clone(),
+            };
+            emit_call(ctx, &func_id, &target, node_line(&init));
+            analyze_csharp_calls(&init, &func_id, &type_id, ctx)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a property, indexer or event declares code: an accessor with a
+/// body or an expression body. `{ get; set; }` declares none.
+fn csharp_has_code(node: &Node<'_>) -> bool {
+    if node.child_by_field_name("value").is_some() {
+        return true;
+    }
+    match node.child_by_field_name("accessors") {
+        Some(list) => {
+            let mut cursor = list.walk();
+            let found = list
+                .named_children(&mut cursor)
+                .any(|a| a.child_by_field_name("body").is_some());
+            found
+        }
+        None => false,
+    }
+}
+
+/// .NET's names for user-defined operators (`op_Addition`), so overloads of
+/// different operators are different functions.
+fn csharp_operator_name(op: &str) -> String {
+    let name = match op.trim() {
+        "+" => "op_Addition",
+        "-" => "op_Subtraction",
+        "*" => "op_Multiply",
+        "/" => "op_Division",
+        "%" => "op_Modulus",
+        "==" => "op_Equality",
+        "!=" => "op_Inequality",
+        "<" => "op_LessThan",
+        ">" => "op_GreaterThan",
+        "<=" => "op_LessThanOrEqual",
+        ">=" => "op_GreaterThanOrEqual",
+        "!" => "op_LogicalNot",
+        "~" => "op_OnesComplement",
+        "++" => "op_Increment",
+        "--" => "op_Decrement",
+        "&" => "op_BitwiseAnd",
+        "|" => "op_BitwiseOr",
+        "^" => "op_ExclusiveOr",
+        "<<" => "op_LeftShift",
+        ">>" => "op_RightShift",
+        "true" => "op_True",
+        "false" => "op_False",
+        other => return format!("op_{}", normalize_id(other)),
+    };
+    name.to_string()
+}
+
+/// Calls in a member's code. Lambdas' calls belong to the member; a local
+/// function is a function of its own, scoped by the member.
+fn analyze_csharp_calls(
+    node: &Node<'_>,
+    func_id: &str,
+    type_id: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    for child in children {
+        match child.kind() {
+            "invocation_expression" => {
+                if let Some(callee) = child
+                    .child_by_field_name("function")
+                    .and_then(|f| csharp_callee(&f, ctx.code))
+                {
+                    emit_call(ctx, func_id, &callee, node_line(&child));
+                }
+            }
+            "object_creation_expression" => {
+                if let Some(t) = child.child_by_field_name("type") {
+                    let callee = csharp_type_name(&t, ctx.code);
+                    emit_call(ctx, func_id, &callee, node_line(&child));
+                }
+            }
+            "local_function_statement" => {
+                let name = child
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, ctx.code).to_string())
+                    .unwrap_or_else(|| "local".into());
+                let arity = param_count(&child, "parameters");
+                let line = node_line(&child);
+                let local_id =
+                    ctx.unique_id(scoped_id(func_id, &format!("{}_{}", name, arity)), line);
+                emit_function(
+                    ctx, &local_id, type_id, &name, arity, "private", line, &child,
+                );
+                if let Some(body) = child.child_by_field_name("body") {
+                    analyze_csharp_calls(&body, &local_id, type_id, ctx)?;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        analyze_csharp_calls(&child, func_id, type_id, ctx)?;
+    }
+    Ok(())
+}
+
+/// The callee of an invocation: `F(…)`, `F<T>(…)`, `x.F(…)`, `x?.F(…)`. A
+/// simple receiver that names a type (`Helper.Twice`, `Console.WriteLine`) is
+/// kept; an instance receiver is not part of the name.
+fn csharp_callee(function: &Node<'_>, code: &[u8]) -> Option<String> {
+    match function.kind() {
+        "identifier" => Some(node_text(function, code).to_string()),
+        "generic_name" => Some(csharp_type_name(function, code)),
+        "member_access_expression" => {
+            let name = function.child_by_field_name("name")?;
+            let name = csharp_type_name(&name, code);
+            let receiver = function.child_by_field_name("expression");
+            match receiver {
+                Some(r)
+                    if r.kind() == "identifier"
+                        && node_text(&r, code)
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_uppercase()) =>
+                {
+                    Some(format!("{}.{}", node_text(&r, code), name))
+                }
+                _ => Some(name),
+            }
+        }
+        "member_binding_expression" => function
+            .child_by_field_name("name")
+            .map(|n| csharp_type_name(&n, code)),
+        _ => None,
+    }
+}
+
+// ========================================================================
+// .NET project files
+// ========================================================================
+//
+// A project (`.csproj`, `.fsproj`, `.vbproj`) is a module; its
+// PackageReference, ProjectReference, Reference (assemblies) and
+// TargetFramework(s) are dependencies,
+// as are the versions `Directory.Packages.props` pins. A solution (`.sln`)
+// depends on its projects. Answers "what depends on this package" without
+// reading any code.
+
+fn analyze_msbuild(code: &str, ctx: &mut Ctx<'_>) {
+    let path = ctx.filepath;
+    let stem = path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
+    let module_id = normalize_id(path);
+    emit_module(ctx, &module_id, &stem, path, 1);
+
+    if path.ends_with(".sln") {
+        // Project("{type}") = "Name", "rel\\path.csproj", "{guid}"
+        for (i, line) in code.lines().enumerate() {
+            let t = line.trim_start();
+            if !t.starts_with("Project(") {
+                continue;
+            }
+            let quoted: Vec<&str> = t.split('"').skip(1).step_by(2).collect();
+            if let Some(proj) = quoted.get(2) {
+                if proj.ends_with("proj") {
+                    emit_dependency(ctx, &module_id, &proj.replace('\\', "/"), "project", i + 1);
+                }
+            }
+        }
+        return;
+    }
+
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(code);
+    let mut open: Option<(String, Option<String>, usize)> = None; // element, Include, line
+    let mut deps: Vec<(String, &'static str, usize)> = Vec::new();
+    let line_at = |pos: usize| code[..pos.min(code.len())].matches('\n').count() + 1;
+
+    loop {
+        let pos = reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let tag = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                let mut include = None;
+                let mut version = None;
+                for a in e.attributes().flatten() {
+                    let key = String::from_utf8_lossy(a.key.local_name().as_ref()).to_string();
+                    let val = a
+                        .unescape_value()
+                        .map(|v| v.to_string())
+                        .unwrap_or_default();
+                    match key.as_str() {
+                        "Include" | "Update" => include = Some(val),
+                        "Version" => version = Some(val),
+                        _ => {}
+                    }
+                }
+                let line = line_at(pos);
+                match (tag.as_str(), include) {
+                    ("PackageReference" | "PackageVersion", Some(name)) => {
+                        // `$(NunitPackageVersion)` is set elsewhere; an
+                        // unexpanded property is no version.
+                        let target = match version {
+                            Some(v) if !v.is_empty() && !v.contains("$(") => {
+                                format!("{}@{}", name, v)
+                            }
+                            _ => name,
+                        };
+                        deps.push((target, "package", line));
+                    }
+                    ("ProjectReference", Some(p)) => {
+                        deps.push((p.replace('\\', "/"), "project", line))
+                    }
+                    // .NET Framework assembly references (`System.Web`) and
+                    // shared frameworks (`Microsoft.AspNetCore.App`).
+                    ("Reference" | "FrameworkReference", Some(name)) => {
+                        let name = name.split(',').next().unwrap_or(&name).trim().to_string();
+                        deps.push((name, "assembly", line))
+                    }
+                    ("TargetFramework" | "TargetFrameworks", _) => {
+                        open = Some((tag.clone(), None, line))
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if let Some((_, _, line)) = open.take() {
+                    let text = t.unescape().map(|v| v.to_string()).unwrap_or_default();
+                    for fw in text
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|f| !f.is_empty() && !f.contains("$("))
+                    {
+                        deps.push((fw.to_string(), "target_framework", line));
+                    }
+                }
+            }
+            Ok(Event::End(_)) => open = None,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    // A package is often referenced once per target framework's ItemGroup.
+    let mut seen = std::collections::HashSet::new();
+    for (target, kind, line) in deps {
+        if seen.insert((target.clone(), kind)) {
+            emit_dependency(ctx, &module_id, &target, kind, line);
+        }
+    }
 }
 
 // ========================================================================
