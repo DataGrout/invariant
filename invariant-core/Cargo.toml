@@ -29,6 +29,8 @@ tree-sitter-php.workspace = true
 tree-sitter-prolog.workspace = true
 tree-sitter-c-sharp.workspace = true
 tree-sitter-powershell.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-kotlin-sg.workspace = true
 tree-sitter-tsql.workspace = true
 quick-xml.workspace = true
 

@@ -192,6 +192,8 @@ Show connection, identity, and configuration status.
 | C#         | tree-sitter| `.cs`, `.csx`    |
 | T-SQL      | tree-sitter ([ours](https://github.com/DataGrout/tree-sitter-grammars/tree/main/tree-sitter-tsql)) | `.sql` |
 | PowerShell | tree-sitter| `.ps1`, `.psm1`  |
+| Java       | tree-sitter| `.java`          |
+| Kotlin     | tree-sitter| `.kt`, `.kts`    |
 | .NET projects | XML     | `.csproj`, `.fsproj`, `.vbproj`, `.props`, `.targets`, `.sln` |
 
 ## Architecture

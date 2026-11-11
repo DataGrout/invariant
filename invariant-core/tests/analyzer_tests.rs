@@ -1584,3 +1584,254 @@ fn powershell_pester_files_are_tests() {
         "test('tests_get_dbathing_tests__new_fixture_0', '', test_helper)"
     ));
 }
+
+// ─── Java ────────────────────────────────────────────────────────────────────
+
+const JAVA_CONTROLLER: &str = r#"package org.acme.orders;
+
+import java.util.List;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+@RestController
+@RequestMapping("/orders")
+public class OrderController extends BaseController implements Auditable {
+    private final OrderRepository repo;
+
+    @Autowired
+    public OrderController(OrderRepository repo) { super(repo); this.repo = repo; }
+    public OrderController() { this(null); }
+
+    @GetMapping("/{id}")
+    public Order get(@PathVariable int id) { return repo.findById(id).orElseThrow(() -> new NotFound(id)); }
+    public Order get(String code) { return repo.byCode(code); }
+
+    static <T> List<T> wrap(T x) { return List.of(x); }
+
+    void schedule() {
+        Runnable r = new Runnable() { public void run() { tick(); } };
+    }
+
+    interface Hook { void run(); }
+    record Line(int qty) { int total() { return qty * 2; } }
+    enum State { OPEN, CLOSED; boolean done() { return this == CLOSED; } }
+}
+"#;
+
+fn lens_java(code: &str, path: &str) -> Vec<String> {
+    Analyzer::new()
+        .unwrap()
+        .lens_code(code, Language::Java, path, "sha")
+        .unwrap()
+        .facts
+}
+
+#[test]
+fn java_types_members_and_annotations() {
+    let facts = lens_java(
+        JAVA_CONTROLLER,
+        "src/main/java/org/acme/orders/OrderController.java",
+    );
+    let t = "org_acme_orders_ordercontroller";
+    assert!(has_fact(&facts, &format!("module('{t}', 'org.acme.orders.OrderController', 'class:org.acme.orders.OrderController'")));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{t}', 'BaseController', inherits")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{t}', 'Auditable', inherits")
+    ));
+    assert!(has_fact(
+        &facts,
+        "depends_on('src_main_java_org_acme_orders_ordercontroller', 'java.util.List', import"
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{t}', 'RequestMapping', '\"/orders\"')")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{t}__get_1', 'GetMapping', '\"/{{id}}\"')")
+    ));
+    let gets = facts
+        .iter()
+        .filter(|f| f.starts_with("function(") && f.contains("'get', 1"))
+        .count();
+    assert_eq!(gets, 2, "two get/1 overloads");
+    assert!(has_fact(
+        &facts,
+        &format!("function('{t}__wrap_1', '{t}', 'wrap', 1, package")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("module('{t}_line', 'org.acme.orders.OrderController.Line', 'record:")
+    ));
+    assert!(has_fact(&facts, &format!("function('{t}_state__done_0'")));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{t}_hook__run_0', '{t}_hook', 'run', 0, public")
+    ));
+}
+
+#[test]
+fn java_calls() {
+    let facts = lens_java(
+        JAVA_CONTROLLER,
+        "src/main/java/org/acme/orders/OrderController.java",
+    );
+    let t = "org_acme_orders_ordercontroller";
+    for (caller, callee) in [
+        ("ordercontroller_1", "BaseController"),
+        ("ordercontroller_0", "OrderController"),
+        ("get_1", "findById"),
+        ("get_1", "orElseThrow"),
+        ("get_1", "NotFound"),
+        ("wrap_1", "List.of"),
+        ("schedule_0", "Runnable"),
+    ] {
+        assert!(
+            has_fact(
+                &facts,
+                &format!("calls_external('{t}__{caller}', 'unknown', '{callee}'")
+            ),
+            "{caller} -> {callee}"
+        );
+    }
+    // the anonymous class's method is its own function
+    assert!(facts
+        .iter()
+        .any(|f| f.starts_with("function(") && f.contains("'run', 0") && f.contains("anon_l")));
+    assert!(!has_fact(
+        &facts,
+        &format!("calls_external('{t}__schedule_0', 'unknown', 'tick'")
+    ));
+}
+
+#[test]
+fn java_tests_by_annotation() {
+    let facts = lens_java(
+        "class OrderTest { @Test void totals() { } @ParameterizedTest void each(int n) { } void helper() { } }",
+        "src/test/java/OrderTest.java",
+    );
+    assert!(has_fact(&facts, "test('ordertest__totals_0', '', unit)"));
+    assert!(has_fact(&facts, "test('ordertest__each_1', '', unit)"));
+    assert!(has_fact(
+        &facts,
+        "test('ordertest__helper_0', '', test_helper)"
+    ));
+}
+
+// ─── Kotlin ──────────────────────────────────────────────────────────────────
+
+const KOTLIN_SERVICE: &str = r#"package org.acme.orders
+
+import kotlinx.coroutines.launch
+import org.acme.db.*
+
+@Service
+class OrderService(private val repo: OrderRepository) : BaseService(), Auditable {
+    fun get(id: Int): Order = repo.findById(id) ?: throw NotFound(id)
+    internal suspend fun close(id: Int, note: String = "") { repo.update(id) { closed = true }; Audit.record(id) }
+    val total: Int get() = compute(1)
+    constructor(name: String) : this(Repo(name))
+    companion object { fun create(): OrderService = OrderService(Repo()) }
+}
+
+fun String.shout(): String = uppercase()
+private fun helper(x: Int) = listOf(x).map { it * 2 }
+
+interface Auditable { fun audit() }
+"#;
+
+fn lens_kt(code: &str, path: &str) -> Vec<String> {
+    Analyzer::new()
+        .unwrap()
+        .lens_code(code, Language::Kotlin, path, "sha")
+        .unwrap()
+        .facts
+}
+
+#[test]
+fn kotlin_classes_objects_and_functions() {
+    let facts = lens_kt(KOTLIN_SERVICE, "src/main/kotlin/OrderService.kt");
+    let t = "org_acme_orders_orderservice";
+    assert!(has_fact(
+        &facts,
+        &format!("module('{t}', 'org.acme.orders.OrderService', 'class:")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{t}', 'BaseService', inherits")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{t}', 'Service', '')")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{t}__orderservice_1', '{t}', 'OrderService', 1, public")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{t}__close_2', '{t}', 'close', 2, internal")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function_param('{t}__close_2', 1, 'note', 'String')")
+    ));
+    assert!(has_fact(&facts, &format!("function('{t}__total_0'")));
+    assert!(has_fact(
+        &facts,
+        &format!("module('{t}_companion', 'org.acme.orders.OrderService.Companion', 'object:")
+    ));
+    assert!(has_fact(
+        &facts,
+        "module('org_acme_orders_auditable', 'org.acme.orders.Auditable', 'interface:"
+    ));
+    let f = "src_main_kotlin_orderservice";
+    assert!(has_fact(
+        &facts,
+        &format!("function('{f}__shout_0', '{f}', 'shout', 0, public")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("annotation('{f}__shout_0', 'receiver', 'String')")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("function('{f}__helper_1', '{f}', 'helper', 1, private")
+    ));
+    assert!(has_fact(
+        &facts,
+        &format!("depends_on('{f}', 'org.acme.db.*', import")
+    ));
+}
+
+#[test]
+fn kotlin_calls() {
+    let facts = lens_kt(KOTLIN_SERVICE, "src/main/kotlin/OrderService.kt");
+    let t = "org_acme_orders_orderservice";
+    for (caller, callee) in [
+        ("get_1", "findById"),
+        ("get_1", "NotFound"),
+        ("close_2", "update"),
+        ("close_2", "Audit.record"),
+        ("total_0", "compute"),
+    ] {
+        assert!(
+            has_fact(
+                &facts,
+                &format!("calls_external('{t}__{caller}', 'unknown', '{callee}'")
+            ),
+            "{caller} -> {callee}"
+        );
+    }
+    assert!(has_fact(
+        &facts,
+        &format!("calls_external('{t}_companion__create_0', 'unknown', 'OrderService'")
+    ));
+    assert!(has_fact(
+        &facts,
+        "calls_external('src_main_kotlin_orderservice__helper_1', 'unknown', 'listOf'"
+    ));
+}

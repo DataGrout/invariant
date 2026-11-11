@@ -108,6 +108,8 @@ impl Analyzer {
             Language::CSharp => analyze_csharp(&root, ctx)?,
             Language::TSql => analyze_tsql(&root, ctx)?,
             Language::PowerShell => analyze_powershell(&root, ctx)?,
+            Language::Java => analyze_java(&root, ctx)?,
+            Language::Kotlin => analyze_kotlin(&root, ctx)?,
             Language::MsBuild => unreachable!("handled above"),
         }
 
@@ -264,6 +266,25 @@ fn has_test_attribute(fn_node: &Node<'_>, code: &[u8]) -> bool {
                     | "DataTestMethod"
                     | "TestCase"
                     | "TestCaseSource"
+            ) {
+                return true;
+            }
+        }
+    }
+
+    // Java and Kotlin: @Test and friends among the declaration's modifiers.
+    if let Some(mods) = find_child_by_kind(fn_node, "modifiers") {
+        let mut c = mods.walk();
+        for a in mods.named_children(&mut c) {
+            if !matches!(a.kind(), "marker_annotation" | "annotation") {
+                continue;
+            }
+            let text = node_text(&a, code).trim_start_matches('@');
+            let name = text.split(['(', ' ']).next().unwrap_or("");
+            let short = name.rsplit('.').next().unwrap_or(name);
+            if matches!(
+                short,
+                "Test" | "ParameterizedTest" | "RepeatedTest" | "TestFactory" | "TestTemplate"
             ) {
                 return true;
             }
@@ -3432,6 +3453,772 @@ fn ps_walk(node: &Node<'_>, func_id: &str, module_id: &str, ctx: &mut Ctx<'_>) {
             _ => {}
         }
         ps_walk(&child, func_id, module_id, ctx);
+    }
+}
+
+// ========================================================================
+// Java Analysis
+// ========================================================================
+//
+// As C#: a type's module id is its package-qualified name with its type
+// parameters; methods and constructors (named for the type) are functions;
+// annotations are `annotation(Id, Name, Args)` (Spring's @GetMapping routes,
+// @Transactional); imports and extends/implements are dependencies. Package-
+// private members have visibility `package`. Methods of anonymous and local
+// classes are functions of their own, scoped by the enclosing method.
+
+const JAVA_TYPES: &[&str] = &[
+    "class_declaration",
+    "interface_declaration",
+    "enum_declaration",
+    "record_declaration",
+    "annotation_type_declaration",
+];
+
+fn analyze_java(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let (file_id, file_name) = module_id_from_path(ctx.filepath, ".java", ".");
+    emit_module(ctx, &file_id, &file_name, ctx.filepath, 1);
+    let mut package = String::new();
+    let mut cursor = root.walk();
+    let children: Vec<Node<'_>> = root.named_children(&mut cursor).collect();
+    for child in children {
+        match child.kind() {
+            "package_declaration" => {
+                let mut c = child.walk();
+                let found = child
+                    .named_children(&mut c)
+                    .find(|n| matches!(n.kind(), "scoped_identifier" | "identifier"));
+                if let Some(n) = found {
+                    package = node_text(&n, ctx.code).to_string();
+                }
+            }
+            "import_declaration" => {
+                let text = node_text(&child, ctx.code);
+                let target = text
+                    .trim_start_matches("import")
+                    .trim()
+                    .trim_start_matches("static")
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .to_string();
+                emit_dependency(ctx, &file_id, &target, "import", node_line(&child));
+            }
+            k if JAVA_TYPES.contains(&k) => java_type(&child, &package, ctx),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Annotations among a declaration's modifiers, as annotation facts.
+fn jvm_annotations(node: &Node<'_>, id: &str, ctx: &mut Ctx<'_>) {
+    let Some(mods) = find_child_by_kind(node, "modifiers") else {
+        return;
+    };
+    let mut c = mods.walk();
+    let anns: Vec<Node<'_>> = mods
+        .named_children(&mut c)
+        .filter(|a| matches!(a.kind(), "marker_annotation" | "annotation"))
+        .collect();
+    for a in anns {
+        // Java names the annotation in a field; Kotlin's is `@Name(args)` text.
+        let name = a
+            .child_by_field_name("name")
+            .map(|n| node_text(&n, ctx.code).to_string())
+            .unwrap_or_else(|| {
+                let t = node_text(&a, ctx.code).trim_start_matches('@');
+                t.split(['(', ' ', '\n']).next().unwrap_or("").to_string()
+            });
+        let kotlin_args = (a.child_by_field_name("name").is_none())
+            .then(|| {
+                let t = node_text(&a, ctx.code);
+                t.find('(')
+                    .map(|i| clean_param(t[i + 1..].trim_end().trim_end_matches(')')))
+            })
+            .flatten();
+        let args = a
+            .child_by_field_name("arguments")
+            .map(|x| {
+                let t = node_text(&x, ctx.code);
+                clean_param(t.trim_start_matches('(').trim_end_matches(')'))
+            })
+            .or(kotlin_args)
+            .unwrap_or_default();
+        if !name.is_empty() {
+            ctx.facts.push(Fact::new(
+                "annotation",
+                vec![
+                    FactValue::String(id.to_string()),
+                    FactValue::String(name),
+                    FactValue::String(args),
+                ],
+            ));
+        }
+    }
+}
+
+fn java_visibility(node: &Node<'_>, code: &[u8], in_interface: bool) -> &'static str {
+    let mods = find_child_by_kind(node, "modifiers")
+        .map(|m| node_text(&m, code).to_string())
+        .unwrap_or_default();
+    let words: Vec<&str> = mods.split_whitespace().collect();
+    if words.contains(&"public") || in_interface {
+        "public"
+    } else if words.contains(&"protected") {
+        "protected"
+    } else if words.contains(&"private") {
+        "private"
+    } else {
+        "package"
+    }
+}
+
+fn java_type_name(node: &Node<'_>, code: &[u8]) -> String {
+    let text = node_text(node, code);
+    text.split('<').next().unwrap_or(text).trim().to_string()
+}
+
+fn java_type(node: &Node<'_>, outer: &str, ctx: &mut Ctx<'_>) {
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(&n, ctx.code).to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let generic = node
+        .child_by_field_name("type_parameters")
+        .map(|tp| {
+            let mut c = tp.walk();
+            let names: Vec<String> = tp
+                .named_children(&mut c)
+                .filter(|p| p.kind() == "type_parameter")
+                .filter_map(|p| {
+                    first_identifier_text(&p, ctx.code).or_else(|| {
+                        let mut cc = p.walk();
+                        let found = p
+                            .named_children(&mut cc)
+                            .find(|x| x.kind() == "type_identifier")
+                            .map(|x| node_text(&x, ctx.code).to_string());
+                        found
+                    })
+                })
+                .collect();
+            format!("<{}>", names.join(","))
+        })
+        .unwrap_or_default();
+    let qualified = dotted(outer, &format!("{}{}", name, generic));
+    let type_id = normalize_id(&qualified);
+    let label = node.kind().trim_end_matches("_declaration");
+    emit_module(
+        ctx,
+        &type_id,
+        &qualified,
+        &format!("{}:{}", label, qualified),
+        node_line(node),
+    );
+    jvm_annotations(node, &type_id, ctx);
+
+    let mut first_base: Option<String> = None;
+    for field in ["superclass", "interfaces"] {
+        if let Some(b) = node.child_by_field_name(field) {
+            let mut stack = vec![b];
+            while let Some(n) = stack.pop() {
+                if matches!(
+                    n.kind(),
+                    "type_identifier" | "scoped_type_identifier" | "generic_type"
+                ) {
+                    let base = java_type_name(&n, ctx.code);
+                    if field == "superclass" && first_base.is_none() {
+                        first_base = Some(base.clone());
+                    }
+                    emit_dependency(ctx, &type_id, &base, "inherits", node_line(&n));
+                    continue;
+                }
+                let mut c = n.walk();
+                let mut kids: Vec<Node<'_>> = n.named_children(&mut c).collect();
+                kids.reverse();
+                stack.extend(kids);
+            }
+        }
+    }
+    // interface I extends A, B
+    if let Some(ext) = find_child_by_kind(node, "extends_interfaces") {
+        let mut stack = vec![ext];
+        while let Some(n) = stack.pop() {
+            if matches!(
+                n.kind(),
+                "type_identifier" | "scoped_type_identifier" | "generic_type"
+            ) {
+                let base = java_type_name(&n, ctx.code);
+                emit_dependency(ctx, &type_id, &base, "inherits", node_line(&n));
+                continue;
+            }
+            let mut c = n.walk();
+            stack.extend(n.named_children(&mut c));
+        }
+    }
+
+    let in_interface = matches!(
+        node.kind(),
+        "interface_declaration" | "annotation_type_declaration"
+    );
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    java_members(
+        &body,
+        &type_id,
+        &qualified,
+        &name,
+        first_base.as_deref(),
+        in_interface,
+        ctx,
+    );
+}
+
+/// The members of a class, interface, enum or record body.
+#[allow(clippy::too_many_arguments)]
+fn java_members(
+    body: &Node<'_>,
+    type_id: &str,
+    qualified: &str,
+    type_name: &str,
+    first_base: Option<&str>,
+    in_interface: bool,
+    ctx: &mut Ctx<'_>,
+) {
+    let mut cursor = body.walk();
+    let members: Vec<Node<'_>> = body.named_children(&mut cursor).collect();
+    for member in members {
+        let kind = member.kind();
+        if JAVA_TYPES.contains(&kind) {
+            java_type(&member, qualified, ctx);
+            continue;
+        }
+        if kind == "enum_body_declarations" {
+            java_members(
+                &member,
+                type_id,
+                qualified,
+                type_name,
+                first_base,
+                in_interface,
+                ctx,
+            );
+            continue;
+        }
+        let (fname, arity) = match kind {
+            "method_declaration" | "annotation_type_element_declaration" => (
+                member
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, ctx.code).to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                param_count(&member, "parameters"),
+            ),
+            "constructor_declaration" => {
+                (type_name.to_string(), param_count(&member, "parameters"))
+            }
+            // record R(int a) { R { … } }: the canonical constructor's arity is the record's
+            "compact_constructor_declaration" => (type_name.to_string(), 0),
+            _ => continue,
+        };
+        let line = node_line(&member);
+        let func_id = ctx.unique_id(scoped_id(type_id, &format!("{}_{}", fname, arity)), line);
+        let visibility = java_visibility(&member, ctx.code, in_interface);
+        emit_function(
+            ctx, &func_id, type_id, &fname, arity, visibility, line, &member,
+        );
+        jvm_annotations(&member, &func_id, ctx);
+        if let Some(b) = member.child_by_field_name("body") {
+            java_calls(&b, &func_id, type_id, type_name, first_base, ctx);
+        }
+    }
+}
+
+fn java_calls(
+    node: &Node<'_>,
+    func_id: &str,
+    type_id: &str,
+    type_name: &str,
+    first_base: Option<&str>,
+    ctx: &mut Ctx<'_>,
+) {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    for child in children {
+        match child.kind() {
+            "method_invocation" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    let name = node_text(&name, ctx.code).to_string();
+                    let callee = match child.child_by_field_name("object") {
+                        Some(o)
+                            if o.kind() == "identifier"
+                                && node_text(&o, ctx.code)
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|c| c.is_ascii_uppercase()) =>
+                        {
+                            format!("{}.{}", node_text(&o, ctx.code), name)
+                        }
+                        _ => name,
+                    };
+                    emit_call(ctx, func_id, &callee, node_line(&child));
+                }
+            }
+            "object_creation_expression" => {
+                if let Some(t) = child.child_by_field_name("type") {
+                    let callee = java_type_name(&t, ctx.code);
+                    emit_call(ctx, func_id, &callee, node_line(&child));
+                }
+                // new Runnable() { public void run() { … } }: its methods are functions
+                if let Some(body) = find_child_by_kind(&child, "class_body") {
+                    let anon = scoped_id(func_id, &format!("anon_l{}", node_line(&child)));
+                    java_members(&body, &anon, &anon, "anonymous", None, false, ctx);
+                }
+                // the constructor's arguments
+                if let Some(args) = child.child_by_field_name("arguments") {
+                    java_calls(&args, func_id, type_id, type_name, first_base, ctx);
+                }
+                continue;
+            }
+            "explicit_constructor_invocation" => {
+                let text = node_text(&child, ctx.code).trim_start();
+                let target = if text.starts_with("super") {
+                    first_base
+                        .map(|b| b.rsplit('.').next().unwrap_or(b).to_string())
+                        .unwrap_or_else(|| "super".to_string())
+                } else {
+                    type_name.to_string()
+                };
+                emit_call(ctx, func_id, &target, node_line(&child));
+            }
+            "local_class_declaration" | "class_declaration" => {
+                java_type(&child, type_id, ctx);
+                continue;
+            }
+            _ => {}
+        }
+        java_calls(&child, func_id, type_id, type_name, first_base, ctx);
+    }
+}
+
+// ========================================================================
+// Kotlin Analysis
+// ========================================================================
+//
+// Classes, interfaces, objects and companion objects are modules named by
+// package (a companion is `Outer.Companion`); top-level functions belong to
+// the file's module. Member, top-level and local functions, primary and
+// secondary constructors (named for the class) and properties with custom
+// accessors are functions; an extension function keeps its name and its
+// receiver is an annotation. Delegation specifiers are `inherits`, imports
+// `import`. Statements in scripts (`.kts`, Gradle) are the file's `script`.
+
+fn analyze_kotlin(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let ext = if ctx.filepath.ends_with(".kts") {
+        ".kts"
+    } else {
+        ".kt"
+    };
+    let (file_id, file_name) = module_id_from_path(ctx.filepath, ext, ".");
+    emit_module(ctx, &file_id, &file_name, ctx.filepath, 1);
+    let mut package = String::new();
+    let mut script: Option<String> = None;
+    let mut cursor = root.walk();
+    let children: Vec<Node<'_>> = root.named_children(&mut cursor).collect();
+    for child in children {
+        match child.kind() {
+            "package_header" => {
+                if let Some(id) = find_child_by_kind(&child, "identifier") {
+                    package = node_text(&id, ctx.code).to_string();
+                }
+            }
+            "import_list" | "import_header" => {
+                let headers: Vec<Node<'_>> = if child.kind() == "import_list" {
+                    let mut c = child.walk();
+                    child.named_children(&mut c).collect()
+                } else {
+                    vec![child]
+                };
+                for h in headers {
+                    if let Some(id) = find_child_by_kind(&h, "identifier") {
+                        let mut t = node_text(&id, ctx.code).to_string();
+                        if find_child_by_kind(&h, "wildcard_import").is_some() {
+                            t.push_str(".*");
+                        }
+                        emit_dependency(ctx, &file_id, &t, "import", node_line(&h));
+                    }
+                }
+            }
+            "class_declaration" | "object_declaration" => kotlin_type(&child, &package, ctx),
+            "function_declaration" | "property_declaration" => {
+                kotlin_member(&child, &file_id, "", ctx);
+            }
+            "comment" | "multiline_comment" | "line_comment" | "shebang_line"
+            | "file_annotation" => {}
+            _ => {
+                let id = match &script {
+                    Some(id) => id.clone(),
+                    None => {
+                        let id = scoped_id(&file_id, "script_0");
+                        emit_function(
+                            ctx,
+                            &id,
+                            &file_id,
+                            "script",
+                            0,
+                            "public",
+                            node_line(&child),
+                            &child,
+                        );
+                        script = Some(id.clone());
+                        id
+                    }
+                };
+                kotlin_calls(&child, &id, &file_id, ctx);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn kotlin_visibility(node: &Node<'_>, code: &[u8]) -> &'static str {
+    let Some(mods) = find_child_by_kind(node, "modifiers") else {
+        return "public";
+    };
+    match find_child_by_kind(&mods, "visibility_modifier").map(|v| node_text(&v, code).to_string())
+    {
+        Some(v) if v == "private" => "private",
+        Some(v) if v == "protected" => "protected",
+        Some(v) if v == "internal" => "internal",
+        _ => "public",
+    }
+}
+
+fn kotlin_type(node: &Node<'_>, outer: &str, ctx: &mut Ctx<'_>) {
+    let name = match node.kind() {
+        "companion_object" => find_child_by_kind(node, "type_identifier")
+            .map(|n| node_text(&n, ctx.code).to_string())
+            .unwrap_or_else(|| "Companion".to_string()),
+        _ => find_child_by_kind(node, "type_identifier")
+            .map(|n| node_text(&n, ctx.code).to_string())
+            .unwrap_or_else(|| "Unknown".to_string()),
+    };
+    let qualified = dotted(outer, &name);
+    let type_id = normalize_id(&qualified);
+    let text = node_text(node, ctx.code);
+    let label = if node.kind() == "class_declaration" {
+        let head = text.split(['{', '(']).next().unwrap_or("");
+        if head.split_whitespace().any(|w| w == "interface") {
+            "interface"
+        } else {
+            "class"
+        }
+    } else {
+        "object"
+    };
+    emit_module(
+        ctx,
+        &type_id,
+        &qualified,
+        &format!("{}:{}", label, qualified),
+        node_line(node),
+    );
+    jvm_annotations(node, &type_id, ctx);
+
+    let mut c = node.walk();
+    let parts: Vec<Node<'_>> = node.named_children(&mut c).collect();
+    for p in &parts {
+        match p.kind() {
+            "delegation_specifier" | "delegation_specifiers" => {
+                let mut stack = vec![*p];
+                while let Some(n) = stack.pop() {
+                    if n.kind() == "user_type" {
+                        let base = node_text(&n, ctx.code);
+                        let base = base.split('<').next().unwrap_or(base).trim().to_string();
+                        emit_dependency(ctx, &type_id, &base, "inherits", node_line(&n));
+                        continue;
+                    }
+                    let mut cc = n.walk();
+                    stack.extend(n.named_children(&mut cc));
+                }
+            }
+            "primary_constructor" => {
+                let arity = {
+                    let mut cc = p.walk();
+                    let n = p
+                        .named_children(&mut cc)
+                        .filter(|x| x.kind() == "class_parameter")
+                        .count();
+                    n
+                };
+                let line = node_line(p);
+                let id = ctx.unique_id(scoped_id(&type_id, &format!("{}_{}", name, arity)), line);
+                emit_function(
+                    ctx,
+                    &id,
+                    &type_id,
+                    &name,
+                    arity,
+                    kotlin_visibility(p, ctx.code),
+                    line,
+                    p,
+                );
+            }
+            "class_body" | "enum_class_body" => kotlin_body(p, &type_id, &qualified, &name, ctx),
+            _ => {}
+        }
+    }
+}
+
+fn kotlin_body(
+    body: &Node<'_>,
+    type_id: &str,
+    qualified: &str,
+    type_name: &str,
+    ctx: &mut Ctx<'_>,
+) {
+    let mut c = body.walk();
+    let members: Vec<Node<'_>> = body.named_children(&mut c).collect();
+    // The property a following stray getter/setter belongs to, and its id once emitted.
+    let mut last_property: Option<(Node<'_>, Option<String>)> = None;
+    for m in members {
+        match m.kind() {
+            // An annotated accessor on its own line (`@Synchronized get() = …`)
+            // parses as the property's sibling, not its child.
+            "getter" | "setter" => {
+                if let Some((prop, emitted)) = last_property.as_mut() {
+                    let id = match emitted {
+                        Some(id) => id.clone(),
+                        None => {
+                            let name = find_child_by_kind(prop, "variable_declaration")
+                                .and_then(|v| find_child_by_kind(&v, "simple_identifier"))
+                                .map(|n| node_text(&n, ctx.code).to_string())
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let line = node_line(prop);
+                            let id =
+                                ctx.unique_id(scoped_id(type_id, &format!("{}_0", name)), line);
+                            let vis = kotlin_visibility(prop, ctx.code);
+                            emit_function(ctx, &id, type_id, &name, 0, vis, line, prop);
+                            *emitted = Some(id.clone());
+                            id
+                        }
+                    };
+                    kotlin_calls(&m, &id, type_id, ctx);
+                }
+                continue;
+            }
+            "property_declaration" => last_property = Some((m, None)),
+            _ => last_property = None,
+        }
+        match m.kind() {
+            "class_declaration" | "object_declaration" | "companion_object" => {
+                kotlin_type(&m, qualified, ctx)
+            }
+            "function_declaration" | "property_declaration" => {
+                kotlin_member(&m, type_id, type_name, ctx)
+            }
+            "secondary_constructor" => {
+                let arity = find_child_by_kind(&m, "function_value_parameters")
+                    .map(|p| {
+                        let mut cc = p.walk();
+                        let n = p
+                            .named_children(&mut cc)
+                            .filter(|x| x.kind() == "parameter")
+                            .count();
+                        n
+                    })
+                    .unwrap_or(0);
+                let line = node_line(&m);
+                let id = ctx.unique_id(
+                    scoped_id(type_id, &format!("{}_{}", type_name, arity)),
+                    line,
+                );
+                emit_function(
+                    ctx,
+                    &id,
+                    type_id,
+                    type_name,
+                    arity,
+                    kotlin_visibility(&m, ctx.code),
+                    line,
+                    &m,
+                );
+                kotlin_calls(&m, &id, type_id, ctx);
+            }
+            "anonymous_initializer" => {
+                // init { … }: part of construction
+                let id = scoped_id(type_id, &format!("init_l{}", node_line(&m)));
+                emit_function(ctx, &id, type_id, "init", 0, "private", node_line(&m), &m);
+                kotlin_calls(&m, &id, type_id, ctx);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A function, or a property with a getter, setter or delegate.
+fn kotlin_member(node: &Node<'_>, module_id: &str, _type_name: &str, ctx: &mut Ctx<'_>) {
+    let line = node_line(node);
+    if node.kind() == "property_declaration" {
+        let has_code = find_child_by_kind(node, "getter").is_some()
+            || find_child_by_kind(node, "setter").is_some()
+            || find_child_by_kind(node, "property_delegate").is_some();
+        if !has_code {
+            return;
+        }
+        let Some(var) = find_child_by_kind(node, "variable_declaration") else {
+            return;
+        };
+        let Some(pname) = find_child_by_kind(&var, "simple_identifier") else {
+            return;
+        };
+        let pname = node_text(&pname, ctx.code).to_string();
+        let id = ctx.unique_id(scoped_id(module_id, &format!("{}_0", pname)), line);
+        emit_function(
+            ctx,
+            &id,
+            module_id,
+            &pname,
+            0,
+            kotlin_visibility(node, ctx.code),
+            line,
+            node,
+        );
+        kotlin_calls(node, &id, module_id, ctx);
+        return;
+    }
+    let name = {
+        let mut c = node.walk();
+        let found = node
+            .named_children(&mut c)
+            .find(|n| n.kind() == "simple_identifier")
+            .map(|n| node_text(&n, ctx.code).to_string());
+        found.unwrap_or_else(|| "unknown".to_string())
+    };
+    let params = find_child_by_kind(node, "function_value_parameters");
+    let arity = params
+        .map(|p| {
+            let mut c = p.walk();
+            let n = p
+                .named_children(&mut c)
+                .filter(|x| x.kind() == "parameter")
+                .count();
+            n
+        })
+        .unwrap_or(0);
+    let id = ctx.unique_id(scoped_id(module_id, &format!("{}_{}", name, arity)), line);
+    emit_function(
+        ctx,
+        &id,
+        module_id,
+        &name,
+        arity,
+        kotlin_visibility(node, ctx.code),
+        line,
+        node,
+    );
+    if let Some(p) = params {
+        let mut c = p.walk();
+        let ps: Vec<Node<'_>> = p
+            .named_children(&mut c)
+            .filter(|x| x.kind() == "parameter")
+            .collect();
+        for (i, param) in ps.iter().enumerate() {
+            let pn = find_child_by_kind(param, "simple_identifier")
+                .map(|n| node_text(&n, ctx.code).to_string())
+                .unwrap_or_default();
+            let mut cc = param.walk();
+            let ty = param
+                .named_children(&mut cc)
+                .find(|n| n.kind() != "simple_identifier")
+                .map(|n| clean_param(node_text(&n, ctx.code)));
+            ctx.facts.push(Fact::new(
+                "function_param",
+                vec![
+                    FactValue::String(id.clone()),
+                    FactValue::Integer(i as i64),
+                    FactValue::String(pn),
+                    match ty {
+                        Some(t) => FactValue::String(t),
+                        None => FactValue::Atom("unknown".to_string()),
+                    },
+                ],
+            ));
+        }
+    }
+    jvm_annotations(node, &id, ctx);
+    if let Some(r) = node.child_by_field_name("receiver") {
+        ctx.facts.push(Fact::new(
+            "annotation",
+            vec![
+                FactValue::String(id.clone()),
+                FactValue::String("receiver".to_string()),
+                FactValue::String(clean_param(node_text(&r, ctx.code))),
+            ],
+        ));
+    }
+    if let Some(body) = find_child_by_kind(node, "function_body") {
+        kotlin_calls(&body, &id, module_id, ctx);
+    }
+}
+
+fn kotlin_calls(node: &Node<'_>, func_id: &str, module_id: &str, ctx: &mut Ctx<'_>) {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    for child in children {
+        match child.kind() {
+            "call_expression" => {
+                if let Some(callee) = child
+                    .named_child(0)
+                    .and_then(|f| kotlin_callee(&f, ctx.code))
+                {
+                    emit_call(ctx, func_id, &callee, node_line(&child));
+                }
+            }
+            "function_declaration" => {
+                // a local function
+                kotlin_member(&child, module_id, "", ctx);
+                continue;
+            }
+            "class_declaration" | "object_declaration" => {
+                kotlin_type(&child, module_id, ctx);
+                continue;
+            }
+            _ => {}
+        }
+        kotlin_calls(&child, func_id, module_id, ctx);
+    }
+}
+
+/// `f(…)`, `x.f(…)`, `Type.f(…)`: a type receiver is kept.
+fn kotlin_callee(function: &Node<'_>, code: &[u8]) -> Option<String> {
+    match function.kind() {
+        "simple_identifier" => Some(node_text(function, code).to_string()),
+        "navigation_expression" => {
+            let suffix = {
+                let mut c = function.walk();
+                let found = function
+                    .named_children(&mut c)
+                    .filter(|n| n.kind() == "navigation_suffix")
+                    .last();
+                found
+            }?;
+            let name = find_child_by_kind(&suffix, "simple_identifier")
+                .map(|n| node_text(&n, code).to_string())?;
+            match function.named_child(0) {
+                Some(r)
+                    if r.kind() == "simple_identifier"
+                        && node_text(&r, code)
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_uppercase()) =>
+                {
+                    Some(format!("{}.{}", node_text(&r, code), name))
+                }
+                _ => Some(name),
+            }
+        }
+        _ => None,
     }
 }
 
