@@ -188,7 +188,7 @@ Show connection, identity, and configuration status.
 | Elixir     | tree-sitter| `.ex`, `.exs`    |
 | Ruby       | tree-sitter| `.rb`, `.rake`, `.gemspec` |
 | PHP        | tree-sitter| `.php`, `.phtml` |
-| Prolog     | tree-sitter| `.pl`, `.plt`, `.pro`, `.prolog` |
+| Prolog     | tree-sitter ([ours](https://github.com/DataGrout/tree-sitter-grammars/tree/main/tree-sitter-prolog)) | `.pl`, `.plt`, `.pro`, `.prolog` |
 | C#         | tree-sitter| `.cs`, `.csx`    |
 | T-SQL      | tree-sitter ([ours](https://github.com/DataGrout/tree-sitter-grammars/tree/main/tree-sitter-tsql)) | `.sql` |
 | PowerShell | tree-sitter| `.ps1`, `.psm1`  |
