@@ -6,6 +6,19 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- `invariant query --filter TEXT` keeps the rows mentioning a table, package,
+  annotation or path; `Bridge::query_filtered` does the same for library
+  callers. With it, DataGrout's `invariant.code_query` answers four new
+  queries over the facts 0.8.1 lenses: `table_access` (which routines read and
+  write which SQL tables), `routes` (ASP.NET and Spring routes with their auth
+  annotations), `annotations` and `dependencies`.
+
+---
+
 ## [0.8.1] - 2026-11-10
 
 ### Added

@@ -81,6 +81,10 @@ enum Commands {
         #[arg(long)]
         namespace: Option<String>,
 
+        /// Keep only rows mentioning this text, e.g. a table, package or annotation
+        #[arg(long)]
+        filter: Option<String>,
+
         /// Output format
         #[arg(long, default_value = "text")]
         output: OutputFormat,
@@ -306,11 +310,12 @@ async fn main() -> Result<()> {
             query,
             commit,
             namespace,
+            filter,
             output,
         } => {
             let namespace =
                 namespace.or_else(|| LensState::lensed_namespace(&project_root.join(".invariant")));
-            cmd_query(&config, query, commit, namespace, output).await?
+            cmd_query(&config, query, commit, namespace, filter, output).await?
         }
         Commands::Diff {
             rev,
@@ -862,6 +867,7 @@ async fn cmd_query(
     query_name: String,
     commit: Option<String>,
     namespace: Option<String>,
+    filter: Option<String>,
     output: OutputFormat,
 ) -> Result<()> {
     let bridge = require_bridge(config).await?;
@@ -881,11 +887,12 @@ async fn cmd_query(
     }
 
     let result = bridge
-        .query(
+        .query_filtered(
             &repo_id,
             &query_name,
             Some(&commit_sha),
             namespace.as_deref(),
+            filter.as_deref(),
         )
         .await?;
 
