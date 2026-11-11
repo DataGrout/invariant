@@ -63,7 +63,11 @@ impl FactValue {
     pub fn to_prolog(&self) -> String {
         match self {
             FactValue::String(s) => format!("'{}'", escape_prolog_string(s)),
-            FactValue::Atom(a) => a.clone(),
+            // An atom that isn't a plain lowercase identifier must be quoted,
+            // or text like `include("foo=;",` is written as Prolog syntax and
+            // the whole fact fails to parse on the server.
+            FactValue::Atom(a) if is_plain_atom(a) => a.clone(),
+            FactValue::Atom(a) => format!("'{}'", escape_prolog_string(a)),
             FactValue::Integer(i) => i.to_string(),
             FactValue::Float(f) => f.to_string(),
             FactValue::List(items) => {
@@ -84,6 +88,13 @@ impl FactValue {
             }
         }
     }
+}
+
+/// `foo`, `public`, `test_helper`: a Prolog atom that needs no quotes.
+fn is_plain_atom(a: &str) -> bool {
+    let mut chars = a.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Escape special characters in Prolog strings

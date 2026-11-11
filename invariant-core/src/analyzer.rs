@@ -13,6 +13,28 @@ struct Ctx<'a> {
     commit_sha: &'a str,
     facts: &'a mut Vec<Fact>,
     summary: &'a mut AnalysisSummary,
+    /// Function ids already emitted, for languages where one function is
+    /// written as several clauses (Elixir).
+    seen_functions: std::collections::HashSet<String>,
+    /// Ids handed out by `unique_id`, for languages where one name can be
+    /// bound several times in a scope.
+    taken_ids: std::collections::HashSet<String>,
+}
+
+impl Ctx<'_> {
+    /// `id`, or `id` with its line appended when the id is already taken in
+    /// this file: the same name bound twice in one scope (a TS namespace's
+    /// `from`, a helper declared in each test callback, `perform` in many
+    /// object literals) otherwise merged distinct functions into one.
+    fn unique_id(&mut self, id: String, line: usize) -> String {
+        let id = if self.taken_ids.contains(&id) {
+            normalize_id(&format!("{}_l{}", id, line))
+        } else {
+            id
+        };
+        self.taken_ids.insert(id.clone());
+        id
+    }
 }
 
 /// Multi-language code analyzer powered by tree-sitter.
@@ -48,6 +70,8 @@ impl Analyzer {
             commit_sha,
             facts: &mut facts,
             summary: &mut summary,
+            seen_functions: std::collections::HashSet::new(),
+            taken_ids: std::collections::HashSet::new(),
         };
 
         match language {
@@ -86,6 +110,14 @@ impl Analyzer {
 // Helpers
 // ========================================================================
 
+/// An id scoped by its enclosing module or class id: `<scope>__<local>`.
+/// Bare `name_arity` ids collided across files (every module's `new_0`),
+/// merging unrelated functions into one node; classes are scoped by file
+/// for the same reason.
+fn scoped_id(scope: &str, local: &str) -> String {
+    normalize_id(&format!("{}__{}", scope, local))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_function(
     ctx: &mut Ctx<'_>,
@@ -118,6 +150,16 @@ fn emit_function(
         ],
     ));
 
+    // The file directly: a method's module is its class, whose module/5 path
+    // is `class:Name`, so the module join cannot locate it.
+    ctx.facts.push(Fact::new(
+        "function_file",
+        vec![
+            FactValue::String(func_id.to_string()),
+            FactValue::String(ctx.filepath.to_string()),
+        ],
+    ));
+
     ctx.facts.push(Fact::new(
         "function_visibility",
         vec![
@@ -128,7 +170,93 @@ fn emit_function(
 
     emit_params(ctx, func_id, fn_node);
 
+    if let Some(kind) = test_kind(ctx.filepath, name, fn_node, ctx.code) {
+        // test(TestFuncID, TestedFuncID, Kind): what it tests isn't known here,
+        // but marking it lets `orphans` stop listing every test as uncalled
+        // (46 of 54 orphans in one live run were tests).
+        ctx.facts.push(Fact::new(
+            "test",
+            vec![
+                FactValue::String(func_id.to_string()),
+                FactValue::String(String::new()),
+                FactValue::Atom(kind.to_string()),
+            ],
+        ));
+    }
+
     ctx.summary.functions += 1;
+}
+
+/// Whether a function is a test, and which kind: `unit` for a test the runner
+/// calls, `test_helper` for any other function in a test file. A test is never
+/// called from the code under test, so without this every test was an orphan.
+fn test_kind(filepath: &str, name: &str, fn_node: &Node<'_>, code: &[u8]) -> Option<&'static str> {
+    if has_test_attribute(fn_node, code) {
+        return Some("unit");
+    }
+
+    // plunit: `test(Name) :- …` clauses between begin_tests and end_tests.
+    if name == "test" && (filepath.ends_with(".pl") || filepath.ends_with(".plt")) {
+        return Some("unit");
+    }
+
+    if !is_test_file(filepath) {
+        return None;
+    }
+
+    let lower = name.to_ascii_lowercase();
+    let test_named = lower.starts_with("test")
+        || name.starts_with("Benchmark")
+        || name.starts_with("Fuzz")
+        || name.starts_with("Example");
+
+    Some(if test_named { "unit" } else { "test_helper" })
+}
+
+/// Rust's `#[test]`, `#[tokio::test]`, `#[rstest]` and the like, on the
+/// attribute items just before the function.
+fn has_test_attribute(fn_node: &Node<'_>, code: &[u8]) -> bool {
+    let mut prev = fn_node.prev_named_sibling();
+    while let Some(node) = prev {
+        if node.kind() != "attribute_item" {
+            break;
+        }
+        let text = node_text(&node, code);
+        if text.contains("test") {
+            return true;
+        }
+        prev = node.prev_named_sibling();
+    }
+    false
+}
+
+/// Test files by the conventions of the languages Invariant reads.
+pub(crate) fn is_test_file(filepath: &str) -> bool {
+    let path = filepath.replace('\\', "/");
+    let segments: Vec<&str> = path.split('/').collect();
+    let file = segments.last().copied().unwrap_or("");
+
+    let in_test_dir = segments[..segments.len().saturating_sub(1)]
+        .iter()
+        .any(|s| {
+            matches!(
+                *s,
+                "test" | "tests" | "spec" | "specs" | "__tests__" | "testing"
+            )
+        });
+
+    let stem = file.split('.').next().unwrap_or(file);
+    let test_named = file.contains(".test.")
+        || file.contains(".spec.")
+        || stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with("_tests")
+        || stem.ends_with("_spec")
+        || (stem.ends_with("Test") && stem.len() > 4)
+        || (stem.ends_with("Tests") && stem.len() > 5)
+        || stem == "conftest";
+
+    in_test_dir || test_named
 }
 
 /// Emit `function_param(FuncId, Position, Name, Type)` for each parameter of a
@@ -320,7 +448,7 @@ fn analyze_python_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
     for child in node.children(&mut cursor) {
         match child.kind() {
             "function_definition" => {
-                analyze_python_function(&child, module_id, ctx)?;
+                analyze_python_function(&child, module_id, module_id, ctx)?;
             }
             "class_definition" => {
                 analyze_python_class(&child, ctx)?;
@@ -337,14 +465,23 @@ fn analyze_python_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
     Ok(())
 }
 
-fn analyze_python_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+/// `scope` scopes the id: the module or class, or the enclosing function for
+/// a nested `def`.
+fn analyze_python_function(
+    node: &Node<'_>,
+    module_id: &str,
+    scope: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
     let name_node = node
         .child_by_field_name("name")
         .ok_or_else(|| Error::Parse("Function has no name".to_string()))?;
     let func_name = node_text(&name_node, ctx.code);
     let arity = param_count(node, "parameters");
-    let func_id = normalize_id(&format!("{}_{}", func_name, arity));
     let line = node_line(node);
+    // A name defined twice in one scope (conditional defs, redefinitions in
+    // tests) is two functions.
+    let func_id = ctx.unique_id(scoped_id(scope, &format!("{}_{}", func_name, arity)), line);
 
     let visibility = if func_name.starts_with("__") && func_name.ends_with("__") {
         "public"
@@ -361,7 +498,44 @@ fn analyze_python_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) 
     );
 
     if let Some(body) = node.child_by_field_name("body") {
-        analyze_calls(&body, ctx.code, &func_id, ctx, "call")?;
+        analyze_python_body(&body, module_id, &func_id, ctx)?;
+    }
+
+    Ok(())
+}
+
+/// A function body: its calls, and nested `def`s as functions of their own.
+/// Nested functions were never emitted and their calls were credited to the
+/// outer function (django: 33,014 definitions, 31,242 emitted).
+fn analyze_python_body(
+    node: &Node<'_>,
+    module_id: &str,
+    func_id: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" => {
+                analyze_python_function(&child, module_id, func_id, ctx)?;
+                continue;
+            }
+            "class_definition" => {
+                analyze_python_class(&child, ctx)?;
+                continue;
+            }
+            "call" => {
+                if let Some(f) = child.child_by_field_name("function") {
+                    let callee = callee_name(&f, ctx.code);
+                    if !callee.is_empty() {
+                        emit_call(ctx, func_id, &callee, node_line(&child));
+                    }
+                }
+            }
+            _ => {}
+        }
+        analyze_python_body(&child, module_id, func_id, ctx)?;
     }
 
     Ok(())
@@ -372,7 +546,7 @@ fn analyze_python_class(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
         .child_by_field_name("name")
         .ok_or_else(|| Error::Parse("Class has no name".to_string()))?;
     let class_name = node_text(&name_node, ctx.code);
-    let class_id = normalize_id(class_name);
+    let class_id = scoped_id(&normalize_id(ctx.filepath), class_name);
 
     emit_module(
         ctx,
@@ -413,23 +587,28 @@ fn analyze_rust(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     let (module_id, module_name) = module_id_from_path(ctx.filepath, ".rs", "::");
     emit_module(ctx, &module_id, &module_name, ctx.filepath, 1);
 
-    let mut cursor = root.walk();
-    for node in root.children(&mut cursor) {
+    analyze_rust_items(root, &module_id, ctx)
+}
+
+/// The items of a file, or of an inline `mod name { … }` body.
+fn analyze_rust_items(container: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    let mut cursor = container.walk();
+    for node in container.children(&mut cursor) {
         match node.kind() {
             "function_item" => {
-                analyze_rust_function(&node, &module_id, None, ctx)?;
+                analyze_rust_function(&node, module_id, None, ctx)?;
             }
             "struct_item" | "enum_item" | "trait_item" => {
-                analyze_rust_type(&node, &module_id, ctx)?;
+                analyze_rust_type(&node, module_id, ctx)?;
             }
             "impl_item" => {
-                analyze_rust_impl(&node, &module_id, ctx)?;
+                analyze_rust_impl(&node, module_id, ctx)?;
             }
             "use_declaration" => {
-                analyze_rust_use(&node, &module_id, ctx)?;
+                analyze_rust_use(&node, module_id, ctx)?;
             }
             "mod_item" => {
-                analyze_rust_mod(&node, &module_id, ctx)?;
+                analyze_rust_mod(&node, module_id, ctx)?;
             }
             _ => {}
         }
@@ -455,9 +634,9 @@ fn analyze_rust_function(
     let arity = param_count(node, "parameters");
     let func_id = match impl_type_prefix {
         Some(prefix) if !prefix.is_empty() => {
-            normalize_id(&format!("{}_{}_{}", prefix, func_name, arity))
+            scoped_id(module_id, &format!("{}_{}_{}", prefix, func_name, arity))
         }
-        _ => normalize_id(&format!("{}_{}", func_name, arity)),
+        _ => scoped_id(module_id, &format!("{}_{}", func_name, arity)),
     };
     let line = node_line(node);
 
@@ -481,7 +660,7 @@ fn analyze_rust_function(
 fn analyze_rust_type(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
     if let Some(name_node) = node.child_by_field_name("name") {
         let type_name = node_text(&name_node, ctx.code);
-        let type_id = normalize_id(type_name);
+        let type_id = scoped_id(module_id, type_name);
         emit_module(
             ctx,
             &type_id,
@@ -489,6 +668,22 @@ fn analyze_rust_type(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Res
             &format!("type:{}", module_id),
             node_line(node),
         );
+
+        // A trait's default methods have bodies and run like any other
+        // method; they were never emitted.
+        if node.kind() == "trait_item" {
+            if let Some(body) = node.child_by_field_name("body") {
+                let prefix = normalize_id(type_name);
+                let mut cursor = body.walk();
+                for child in body.children(&mut cursor) {
+                    if child.kind() == "function_item"
+                        && child.child_by_field_name("body").is_some()
+                    {
+                        analyze_rust_function(&child, module_id, Some(&prefix), ctx)?;
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -516,26 +711,94 @@ fn analyze_rust_impl(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Res
 }
 
 fn analyze_rust_use(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
-    let text = node_text(node, ctx.code);
+    // `use a::b::{c, d::e, self as f};` depends on a.b.c, a.b.d.e and a.b:
+    // one target per item, read from the use tree. Splitting the text on
+    // whitespace left targets like `regex_syntax.hir.{`.
+    let Some(arg) = node.child_by_field_name("argument") else {
+        return Ok(());
+    };
 
-    if let Some(used_module) = text
-        .strip_prefix("use ")
-        .and_then(|s| s.split_whitespace().next())
-    {
-        let used_module = used_module.trim_end_matches(';').replace("::", ".");
-        emit_dependency(ctx, module_id, &used_module, "use", node_line(node));
+    let mut targets = Vec::new();
+    rust_use_targets(&arg, "", ctx.code, &mut targets);
+
+    let line = node_line(node);
+    for target in targets {
+        if !target.is_empty() {
+            emit_dependency(ctx, module_id, &target, "use", line);
+        }
     }
 
     Ok(())
 }
 
-fn analyze_rust_mod(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
-    if let Some(name_node) = node.child_by_field_name("name") {
-        let mod_name = node_text(&name_node, ctx.code);
-        emit_dependency(ctx, module_id, mod_name, "mod", node_line(node));
-    }
+/// Expand a use tree into `a.b.c` targets under `prefix`.
+fn rust_use_targets(node: &Node<'_>, prefix: &str, code: &[u8], out: &mut Vec<String>) {
+    let join = |p: &str, s: &str| {
+        let s = s.replace("::", ".");
+        if p.is_empty() {
+            s
+        } else if s.is_empty() || s == "self" {
+            p.to_string()
+        } else {
+            format!("{}.{}", p, s)
+        }
+    };
 
-    Ok(())
+    match node.kind() {
+        "scoped_use_list" => {
+            let path = node
+                .child_by_field_name("path")
+                .map(|p| node_text(&p, code).to_string())
+                .unwrap_or_default();
+            let base = join(prefix, &path);
+            if let Some(list) = node.child_by_field_name("list") {
+                rust_use_targets(&list, &base, code, out);
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for item in node.named_children(&mut cursor) {
+                rust_use_targets(&item, prefix, code, out);
+            }
+        }
+        // `x as y`: the dependency is x.
+        "use_as_clause" => {
+            if let Some(path) = node.child_by_field_name("path") {
+                rust_use_targets(&path, prefix, code, out);
+            }
+        }
+        // `a::*`: the module a.
+        "use_wildcard" => {
+            let text = node_text(node, code);
+            out.push(join(
+                prefix,
+                text.trim_end_matches("::*").trim_end_matches('*'),
+            ));
+        }
+        _ => out.push(join(prefix, node_text(node, code))),
+    }
+}
+
+fn analyze_rust_mod(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return Ok(());
+    };
+    let mod_name = node_text(&name_node, ctx.code);
+
+    match node.child_by_field_name("body") {
+        // An inline `mod tests { … }` is code in this file: its items were
+        // skipped, and the module was recorded as a dependency.
+        Some(body) => {
+            let sub_id = scoped_id(module_id, mod_name);
+            emit_module(ctx, &sub_id, mod_name, ctx.filepath, node_line(node));
+            analyze_rust_items(&body, &sub_id, ctx)
+        }
+        // `mod name;` declares a module in another file.
+        None => {
+            emit_dependency(ctx, module_id, mod_name, "mod", node_line(node));
+            Ok(())
+        }
+    }
 }
 
 fn has_pub_modifier(node: &Node<'_>, code: &[u8]) -> bool {
@@ -553,17 +816,68 @@ fn has_pub_modifier(node: &Node<'_>, code: &[u8]) -> bool {
 // ========================================================================
 
 fn analyze_javascript(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
-    let module_name = ctx
-        .filepath
-        .trim_end_matches(".js")
-        .trim_end_matches(".ts")
-        .trim_end_matches(".jsx")
-        .trim_end_matches(".tsx")
-        .replace(['/', '\\'], ".");
+    let mut stem = ctx.filepath;
+    for ext in [".jsx", ".tsx", ".mjs", ".cjs", ".mts", ".cts", ".js", ".ts"] {
+        if let Some(s) = stem.strip_suffix(ext) {
+            stem = s;
+            break;
+        }
+    }
+    let module_name = stem.replace(['/', '\\'], ".");
     let module_id = normalize_id(&module_name);
     emit_module(ctx, &module_id, &module_name, ctx.filepath, 1);
 
     analyze_js_node(root, &module_id, ctx)
+}
+
+/// Function-like nodes in the JS/TS grammars.
+fn is_js_function(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "generator_function_declaration"
+            | "method_definition"
+            | "arrow_function"
+            | "function_expression"
+            | "function"
+            | "generator_function"
+    )
+}
+
+/// The name a function goes by: its own, or the one it is bound to. An arrow
+/// function or function expression has no name of its own; it takes the
+/// variable (`const add = (a, b) => …`), object key, assignment target
+/// (`View.prototype.lookup = function …`) or class field it is assigned to.
+/// None for an inline callback, whose calls belong to the function around it.
+fn js_function_name(node: &Node<'_>, code: &[u8]) -> Option<String> {
+    if let Some(n) = node.child_by_field_name("name") {
+        return Some(node_text(&n, code).to_string());
+    }
+
+    let parent = node.parent()?;
+    let bound = match parent.kind() {
+        "variable_declarator" => parent
+            .child_by_field_name("name")
+            .filter(|n| n.kind() == "identifier"),
+        "pair" => parent.child_by_field_name("key"),
+        "assignment_expression" => parent.child_by_field_name("left").map(|left| {
+            if left.kind() == "member_expression" {
+                left.child_by_field_name("property").unwrap_or(left)
+            } else {
+                left
+            }
+        }),
+        "public_field_definition" | "field_definition" | "property_definition" => parent
+            .child_by_field_name("name")
+            .or_else(|| parent.child_by_field_name("property")),
+        "export_statement" => return Some("default".to_string()),
+        _ => None,
+    }?;
+
+    let text = node_text(&bound, code)
+        .trim_matches(['"', '\'', '`'])
+        .trim();
+    (!text.is_empty() && !text.contains(char::is_whitespace)).then(|| text.to_string())
 }
 
 fn analyze_js_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
@@ -571,14 +885,39 @@ fn analyze_js_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Resul
 
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "function_declaration" | "method_definition" | "arrow_function" => {
-                analyze_js_function(&child, module_id, ctx)?;
+            // At module level an unnamed function (a test file's
+            // `describe('…', () => …)`, an IIFE) has no function around it to
+            // own its calls, so it is one, named by its line: unique, where
+            // every one of them used to be `anonymous` (67 in one TSX file).
+            kind if is_js_function(kind) => {
+                let name = js_function_name(&child, ctx.code)
+                    .unwrap_or_else(|| format!("anonymous_l{}", node_line(&child)));
+                analyze_js_function(&child, module_id, module_id, &name, ctx)?
             }
-            "class_declaration" => {
+            "class_declaration" | "class" => {
                 analyze_js_class(&child, ctx)?;
             }
             "import_statement" => {
                 analyze_js_import(&child, module_id, ctx)?;
+            }
+            // `namespace Range { export function from() }`: the namespace is
+            // a scope, or every namespace's `from` is one id.
+            "internal_module" | "module" => {
+                let name = child
+                    .child_by_field_name("name")
+                    .map(|n| node_text(&n, ctx.code).to_string());
+                match (name, child.child_by_field_name("body")) {
+                    (Some(name), Some(body)) => {
+                        let ns_id = scoped_id(module_id, &name);
+                        emit_module(ctx, &ns_id, &name, ctx.filepath, node_line(&child));
+                        analyze_js_node(&body, &ns_id, ctx)?;
+                    }
+                    _ => analyze_js_node(&child, module_id, ctx)?,
+                }
+            }
+            "call_expression" => {
+                analyze_js_require(&child, module_id, ctx);
+                analyze_js_node(&child, module_id, ctx)?;
             }
             _ => {
                 analyze_js_node(&child, module_id, ctx)?;
@@ -589,29 +928,106 @@ fn analyze_js_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Resul
     Ok(())
 }
 
-fn analyze_js_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
-    let name = node
-        .child_by_field_name("name")
-        .map(|n| node_text(&n, ctx.code).to_string())
-        .unwrap_or_else(|| "anonymous".to_string());
-
+/// `scope` is the id the function's own id is scoped by: the module for a
+/// top-level or class function, the enclosing function for a nested one.
+fn analyze_js_function(
+    node: &Node<'_>,
+    module_id: &str,
+    scope: &str,
+    name: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
     let arity = param_count(node, "parameters");
-    let func_id = normalize_id(&format!("{}_{}", name, arity));
     let line = node_line(node);
+    let func_id = ctx.unique_id(scoped_id(scope, &format!("{}_{}", name, arity)), line);
 
-    emit_function(ctx, &func_id, module_id, &name, arity, "public", line, node);
+    emit_function(ctx, &func_id, module_id, name, arity, "public", line, node);
 
     if let Some(body) = node.child_by_field_name("body") {
-        analyze_calls(&body, ctx.code, &func_id, ctx, "call_expression")?;
+        analyze_js_body(&body, module_id, &func_id, ctx)?;
     }
 
     Ok(())
 }
 
+/// A function body: its calls, and the named functions declared inside it,
+/// which become functions of their own. An unnamed callback stays part of the
+/// body, so `arr.map(x => f(x))` still records the call to `f` here.
+fn analyze_js_body(
+    node: &Node<'_>,
+    module_id: &str,
+    func_id: &str,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        let kind = child.kind();
+
+        if is_js_function(kind) {
+            if let Some(name) = js_function_name(&child, ctx.code) {
+                analyze_js_function(&child, module_id, func_id, &name, ctx)?;
+                continue;
+            }
+        }
+
+        match kind {
+            "call_expression" => {
+                if let Some(f) = child.child_by_field_name("function") {
+                    let callee = callee_name(&f, ctx.code);
+                    if !callee.is_empty() {
+                        emit_call(ctx, func_id, &callee, node_line(&child));
+                    }
+                }
+                analyze_js_require(&child, module_id, ctx);
+            }
+            // `new X(...)` runs X's constructor.
+            "new_expression" => {
+                if let Some(c) = child.child_by_field_name("constructor") {
+                    let callee = callee_name(&c, ctx.code);
+                    if !callee.is_empty() {
+                        emit_call(ctx, func_id, &callee, node_line(&child));
+                    }
+                }
+            }
+            "class_declaration" | "class" => {
+                analyze_js_class(&child, ctx)?;
+                continue;
+            }
+            _ => {}
+        }
+
+        analyze_js_body(&child, module_id, func_id, ctx)?;
+    }
+
+    Ok(())
+}
+
+/// CommonJS `require('x')` is a dependency, like an import.
+fn analyze_js_require(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) {
+    let Some(f) = node.child_by_field_name("function") else {
+        return;
+    };
+    if f.kind() != "identifier" || node_text(&f, ctx.code) != "require" {
+        return;
+    }
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    if let Some(arg) = args.named_child(0) {
+        if arg.kind() == "string" {
+            let target = node_text(&arg, ctx.code).trim_matches(['"', '\'', '`']);
+            if !target.is_empty() {
+                emit_dependency(ctx, module_id, target, "require", node_line(node));
+            }
+        }
+    }
+}
+
 fn analyze_js_class(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     if let Some(name_node) = node.child_by_field_name("name") {
         let class_name = node_text(&name_node, ctx.code);
-        let class_id = normalize_id(class_name);
+        let class_id = scoped_id(&normalize_id(ctx.filepath), class_name);
 
         emit_module(
             ctx,
@@ -630,16 +1046,16 @@ fn analyze_js_class(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
 }
 
 fn analyze_js_import(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
-    let text = node_text(node, ctx.code);
+    // The module is the import's `source` string: after `from`, or directly
+    // for a side-effect import (`import "./x.scss"`), which had none.
+    let source = node.child_by_field_name("source").map(|n| {
+        node_text(&n, ctx.code)
+            .trim_matches(['"', '\''])
+            .to_string()
+    });
 
-    if let Some(from_idx) = text.find("from") {
-        if let Some(quote_start) = text[from_idx..].find(['"', '\'']) {
-            let remaining = &text[from_idx + quote_start + 1..];
-            if let Some(quote_end) = remaining.find(['"', '\'']) {
-                let imported_module = &remaining[..quote_end];
-                emit_dependency(ctx, module_id, imported_module, "import", node_line(node));
-            }
-        }
+    if let Some(imported_module) = source.filter(|s| !s.is_empty()) {
+        emit_dependency(ctx, module_id, &imported_module, "import", node_line(node));
     }
 
     Ok(())
@@ -679,7 +1095,13 @@ fn analyze_go_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
     };
 
     let arity = param_count(node, "parameters");
-    let func_id = normalize_id(&format!("{}_{}", name, arity));
+    // A method is scoped by its receiver's type: `func (r JSON) Render` and
+    // `func (r IndentedJSON) Render` were one id (gin render/json.go: 13
+    // functions, 3 ids).
+    let func_id = match go_receiver_type(node, ctx.code) {
+        Some(recv) => scoped_id(module_id, &format!("{}_{}_{}", recv, name, arity)),
+        None => scoped_id(module_id, &format!("{}_{}", name, arity)),
+    };
     let line = node_line(node);
 
     let visibility = if name.starts_with(|c: char| c.is_uppercase()) {
@@ -699,11 +1121,43 @@ fn analyze_go_function(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
     Ok(())
 }
 
-fn analyze_go_type(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
-    let text = node_text(node, ctx.code);
+/// The receiver's type name of a Go method: `(r *Router[T])` → `router`.
+fn go_receiver_type(node: &Node<'_>, code: &[u8]) -> Option<String> {
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let param = receiver
+        .children(&mut cursor)
+        .find(|c| c.kind() == "parameter_declaration")?;
+    let ty = param.child_by_field_name("type")?;
+    let text = node_text(&ty, code);
+    let bare = text
+        .trim_start_matches('*')
+        .split('[')
+        .next()
+        .unwrap_or("")
+        .trim();
+    (!bare.is_empty()).then(|| normalize_id(bare))
+}
 
-    if let Some(type_name) = text.split_whitespace().nth(1) {
-        emit_dependency(ctx, module_id, type_name, "type", node_line(node));
+/// A type declaration is a type of this package, like Rust's struct items;
+/// it was recorded as a dependency on its own name.
+fn analyze_go_type(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+    let mut cursor = node.walk();
+    for spec in node.children(&mut cursor) {
+        if !matches!(spec.kind(), "type_spec" | "type_alias") {
+            continue;
+        }
+        if let Some(name_node) = spec.child_by_field_name("name") {
+            let type_name = node_text(&name_node, ctx.code);
+            let type_id = scoped_id(module_id, type_name);
+            emit_module(
+                ctx,
+                &type_id,
+                type_name,
+                &format!("type:{}", module_id),
+                node_line(&spec),
+            );
+        }
     }
 
     Ok(())
@@ -731,10 +1185,26 @@ fn analyze_go_import(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Res
 fn analyze_elixir(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     let (module_id, module_name) = module_id_from_path(ctx.filepath, ".ex", ".");
     emit_module(ctx, &module_id, &module_name, ctx.filepath, 1);
-    analyze_elixir_node(root, &module_id, ctx)
+    analyze_elixir_node(root, &module_id, None, ctx)
 }
 
-fn analyze_elixir_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
+/// Function-defining macros: each is one callable, whatever it is called.
+const ELIXIR_DEFS: &[&str] = &[
+    "def",
+    "defp",
+    "defmacro",
+    "defmacrop",
+    "defguard",
+    "defguardp",
+    "defdelegate",
+];
+
+fn analyze_elixir_node(
+    node: &Node<'_>,
+    module_id: &str,
+    module_name: Option<&str>,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
     let mut cursor = node.walk();
 
     for child in node.children(&mut cursor) {
@@ -743,21 +1213,21 @@ fn analyze_elixir_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
                 if let Some(target) = child.child_by_field_name("target") {
                     let target_text = node_text(&target, ctx.code);
                     match target_text {
-                        "defmodule" => analyze_elixir_defmodule(&child, ctx)?,
-                        "def" | "defp" => {
+                        "defmodule" => analyze_elixir_defmodule(&child, module_name, ctx)?,
+                        t if ELIXIR_DEFS.contains(&t) => {
                             analyze_elixir_function(&child, module_id, target_text, ctx)?
                         }
                         "import" | "use" | "alias" => {
                             analyze_elixir_dep(&child, module_id, target_text, ctx)?
                         }
-                        _ => analyze_elixir_node(&child, module_id, ctx)?,
+                        _ => analyze_elixir_node(&child, module_id, module_name, ctx)?,
                     }
                 } else {
-                    analyze_elixir_node(&child, module_id, ctx)?;
+                    analyze_elixir_node(&child, module_id, module_name, ctx)?;
                 }
             }
             _ => {
-                analyze_elixir_node(&child, module_id, ctx)?;
+                analyze_elixir_node(&child, module_id, module_name, ctx)?;
             }
         }
     }
@@ -765,16 +1235,27 @@ fn analyze_elixir_node(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> R
     Ok(())
 }
 
-fn analyze_elixir_defmodule(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+fn analyze_elixir_defmodule(
+    node: &Node<'_>,
+    parent: Option<&str>,
+    ctx: &mut Ctx<'_>,
+) -> Result<()> {
     // In tree-sitter-elixir, `defmodule Foo do...end` is a `call` node with children:
     //   target: identifier("defmodule")       [field]
     //   arguments: (alias("Foo"))             [no field, find by kind]
     //   do_block: do...end                    [no field, find by kind]
 
-    let module_name = find_child_by_kind(node, "arguments")
+    let local_name = find_child_by_kind(node, "arguments")
         .and_then(|a| a.named_child(0))
         .map(|n| node_text(&n, ctx.code).to_string())
         .unwrap_or_else(|| "Unknown".to_string());
+
+    // A nested `defmodule Child` inside `Parent` is Parent.Child; the parent
+    // was dropped, so two parents' `Helpers` merged into one module.
+    let module_name = match parent {
+        Some(p) => format!("{}.{}", p, local_name),
+        None => local_name,
+    };
 
     let module_id = normalize_id(&module_name);
     emit_module(
@@ -786,7 +1267,7 @@ fn analyze_elixir_defmodule(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     );
 
     if let Some(do_block) = find_child_by_kind(node, "do_block") {
-        analyze_elixir_node(&do_block, &module_id, ctx)?;
+        analyze_elixir_node(&do_block, &module_id, Some(&module_name), ctx)?;
     }
 
     Ok(())
@@ -813,6 +1294,14 @@ fn analyze_elixir_function(
         None => return Ok(()),
     };
 
+    // `def f(x) when is_integer(x)` puts the head under a `when` operator; it
+    // was read whole, naming the function "f(x) when is_integer(x)", arity 0.
+    let head = if head.kind() == "binary_operator" {
+        head.child_by_field_name("left").unwrap_or(head)
+    } else {
+        head
+    };
+
     let (func_name, arity) = if head.kind() == "call" {
         let name = head
             .child_by_field_name("target")
@@ -826,16 +1315,31 @@ fn analyze_elixir_function(
         (node_text(&head, ctx.code).to_string(), 0)
     };
 
-    let func_id = normalize_id(&format!("{}_{}", func_name, arity));
+    let func_id = scoped_id(module_id, &format!("{}_{}", func_name, arity));
     let line = node_line(node);
-    let visibility = if kind == "defp" { "private" } else { "public" };
+    let visibility = if kind.ends_with('p') {
+        "private"
+    } else {
+        "public"
+    };
 
-    emit_function(
-        ctx, &func_id, module_id, &func_name, arity, visibility, line, node,
-    );
+    // Each clause of a multi-clause function is its own `def`; the function
+    // is emitted once, and every clause's calls are attached to it.
+    if ctx.seen_functions.insert(func_id.clone()) {
+        emit_function(
+            ctx, &func_id, module_id, &func_name, arity, visibility, line, node,
+        );
+    }
 
     if let Some(do_block) = find_child_by_kind(node, "do_block") {
         analyze_elixir_calls(&do_block, ctx.code, &func_id, ctx)?;
+    } else {
+        // `def f(x), do: g(x)`: the body is a keyword argument after the
+        // head, and its calls were never read.
+        let mut cursor = args.walk();
+        for arg in args.named_children(&mut cursor).skip(1) {
+            analyze_elixir_calls(&arg, ctx.code, &func_id, ctx)?;
+        }
     }
 
     Ok(())
@@ -872,9 +1376,35 @@ fn analyze_elixir_calls(
         if child.kind() == "call" {
             if let Some(target) = child.child_by_field_name("target") {
                 let called = node_text(&target, code);
+                // Definitions and special forms are syntax, not calls.
                 if !matches!(
                     called,
-                    "def" | "defp" | "defmodule" | "import" | "use" | "alias" | "do" | "end"
+                    "def"
+                        | "defp"
+                        | "defmacro"
+                        | "defmacrop"
+                        | "defguard"
+                        | "defguardp"
+                        | "defdelegate"
+                        | "defmodule"
+                        | "import"
+                        | "use"
+                        | "alias"
+                        | "require"
+                        | "do"
+                        | "end"
+                        | "case"
+                        | "cond"
+                        | "if"
+                        | "unless"
+                        | "for"
+                        | "with"
+                        | "quote"
+                        | "unquote"
+                        | "unquote_splicing"
+                        | "receive"
+                        | "try"
+                        | "fn"
                 ) {
                     emit_call(ctx, func_id, called, node_line(&child));
                 }
@@ -1000,7 +1530,7 @@ fn analyze_ruby_class(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
         .map(|n| node_text(&n, ctx.code).to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let class_id = normalize_id(&class_name);
+    let class_id = scoped_id(&normalize_id(ctx.filepath), &class_name);
     emit_module(
         ctx,
         &class_id,
@@ -1022,7 +1552,9 @@ fn analyze_ruby_module(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
         .map(|n| node_text(&n, ctx.code).to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let module_id = normalize_id(&module_name);
+    // Scoped by file, as classes are: every concern's `ClassMethods` was one
+    // module id across the codebase (rails: 206 cross-file duplicate ids).
+    let module_id = scoped_id(&normalize_id(ctx.filepath), &module_name);
     emit_module(
         ctx,
         &module_id,
@@ -1054,7 +1586,7 @@ fn analyze_ruby_method(
         .map(|n| n.named_child_count())
         .unwrap_or(0);
 
-    let func_id = normalize_id(&format!("{}_{}", name, arity));
+    let func_id = scoped_id(module_id, &format!("{}_{}", name, arity));
     let line = node_line(node);
 
     emit_function(
@@ -1062,10 +1594,52 @@ fn analyze_ruby_method(
     );
 
     if let Some(body) = node.child_by_field_name("body") {
-        analyze_ruby_calls(&body, ctx.code, &func_id, ctx)?;
+        let mut locals = std::collections::HashSet::new();
+        if let Some(params) = node.child_by_field_name("parameters") {
+            ruby_collect_identifiers(&params, ctx.code, &mut locals);
+        }
+        ruby_collect_locals(&body, ctx.code, &mut locals);
+        analyze_ruby_calls(&body, ctx.code, &func_id, &locals, ctx)?;
     }
 
     Ok(())
+}
+
+/// Every identifier under `node`.
+fn ruby_collect_identifiers(
+    node: &Node<'_>,
+    code: &[u8],
+    out: &mut std::collections::HashSet<String>,
+) {
+    if node.kind() == "identifier" {
+        out.insert(node_text(node, code).to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        ruby_collect_identifiers(&child, code, out);
+    }
+}
+
+/// The local variables of a method body: assignment targets and block,
+/// lambda and rescue parameters. Ruby itself reads any other bare name as a
+/// method call, and so does the call walker.
+fn ruby_collect_locals(node: &Node<'_>, code: &[u8], out: &mut std::collections::HashSet<String>) {
+    match node.kind() {
+        "assignment" | "operator_assignment" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                ruby_collect_identifiers(&left, code, out);
+            }
+        }
+        "block_parameters" | "lambda_parameters" | "exception_variable" => {
+            ruby_collect_identifiers(node, code, out);
+            return;
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        ruby_collect_locals(&child, code, out);
+    }
 }
 
 fn analyze_ruby_require(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
@@ -1087,14 +1661,26 @@ fn analyze_ruby_require(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> 
     Ok(())
 }
 
+/// `include Foo`, `extend Bar::Baz`, `include(Qux)`: each constant argument
+/// is a dependency. Only constants count: an RSpec matcher such as
+/// `include("foo=;", "bar")` is a call, not a mixin, and splitting its text
+/// on spaces emitted it as one; `include(Bar)` was dropped.
 fn analyze_ruby_include(node: &Node<'_>, module_id: &str, ctx: &mut Ctx<'_>) -> Result<()> {
-    let text = node_text(node, ctx.code);
-    let parts: Vec<&str> = text.split_whitespace().collect();
+    let kind = node
+        .child_by_field_name("method")
+        .map(|m| node_text(&m, ctx.code).to_string())
+        .unwrap_or_else(|| "include".to_string());
 
-    if parts.len() >= 2 {
-        let kind = parts[0];
-        let included = parts[1];
-        emit_dependency(ctx, module_id, included, kind, node_line(node));
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return Ok(());
+    };
+
+    let mut cursor = args.walk();
+    for arg in args.named_children(&mut cursor) {
+        if matches!(arg.kind(), "constant" | "scope_resolution") {
+            let included = node_text(&arg, ctx.code).to_string();
+            emit_dependency(ctx, module_id, &included, &kind, node_line(node));
+        }
     }
 
     Ok(())
@@ -1104,33 +1690,80 @@ fn analyze_ruby_calls(
     node: &Node<'_>,
     code: &[u8],
     func_id: &str,
+    locals: &std::collections::HashSet<String>,
     ctx: &mut Ctx<'_>,
 ) -> Result<()> {
     let mut cursor = node.walk();
 
     for child in node.children(&mut cursor) {
-        if child.kind() == "call" {
-            if let Some(method) = child.child_by_field_name("method") {
-                let called = node_text(&method, code);
-                if !matches!(
-                    called,
-                    "require"
-                        | "require_relative"
-                        | "include"
-                        | "extend"
-                        | "prepend"
-                        | "attr_reader"
-                        | "attr_writer"
-                        | "attr_accessor"
-                ) {
-                    emit_call(ctx, func_id, called, node_line(&child));
+        match child.kind() {
+            "call" => {
+                let method = child.child_by_field_name("method");
+                if let Some(method) = method {
+                    let called = node_text(&method, code);
+                    if !matches!(
+                        called,
+                        "require"
+                            | "require_relative"
+                            | "include"
+                            | "extend"
+                            | "prepend"
+                            | "attr_reader"
+                            | "attr_writer"
+                            | "attr_accessor"
+                    ) {
+                        emit_call(ctx, func_id, called, node_line(&child));
+                    }
                 }
+                // Its receiver, arguments and block, but not the method name
+                // again as a bare identifier.
+                let mut inner = child.walk();
+                for part in child.children(&mut inner) {
+                    if Some(part.id()) != method.map(|m| m.id()) {
+                        if part.kind() == "identifier" {
+                            ruby_bare_call(&part, code, func_id, locals, ctx);
+                        } else {
+                            analyze_ruby_calls(&part, code, func_id, locals, ctx)?;
+                        }
+                    }
+                }
+                continue;
             }
+            // A bare name that isn't a local is a call with no receiver or
+            // arguments (`app`, `options`); these were never recorded.
+            "identifier" => ruby_bare_call(&child, code, func_id, locals, ctx),
+            // Definitions, not uses.
+            "block_parameters" | "lambda_parameters" | "exception_variable" => continue,
+            "assignment" | "operator_assignment" => {
+                if let Some(right) = child.child_by_field_name("right") {
+                    analyze_ruby_calls(&right, code, func_id, locals, ctx)?;
+                }
+                if child.kind() == "operator_assignment" {
+                    if let Some(left) = child.child_by_field_name("left") {
+                        analyze_ruby_calls(&left, code, func_id, locals, ctx)?;
+                    }
+                }
+                continue;
+            }
+            _ => {}
         }
-        analyze_ruby_calls(&child, code, func_id, ctx)?;
+        analyze_ruby_calls(&child, code, func_id, locals, ctx)?;
     }
 
     Ok(())
+}
+
+fn ruby_bare_call(
+    node: &Node<'_>,
+    code: &[u8],
+    func_id: &str,
+    locals: &std::collections::HashSet<String>,
+    ctx: &mut Ctx<'_>,
+) {
+    let name = node_text(node, code);
+    if !locals.contains(name) && !matches!(name, "private" | "protected" | "public") {
+        emit_call(ctx, func_id, name, node_line(node));
+    }
 }
 
 // ========================================================================
@@ -1220,7 +1853,7 @@ fn analyze_php_class(node: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
         .map(|n| node_text(&n, ctx.code).to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let class_id = normalize_id(&class_name);
+    let class_id = scoped_id(&normalize_id(ctx.filepath), &class_name);
     let kind_label = node.kind().trim_end_matches("_declaration");
     emit_module(
         ctx,
@@ -1282,7 +1915,7 @@ fn analyze_php_function(
         .unwrap_or_else(|| "unknown".to_string());
 
     let arity = param_count(node, "parameters");
-    let func_id = normalize_id(&format!("{}_{}", name, arity));
+    let func_id = scoped_id(module_id, &format!("{}_{}", name, arity));
     let line = node_line(node);
 
     emit_function(
@@ -1470,11 +2103,12 @@ fn analyze_prolog(root: &Node<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
             continue;
         };
 
-        let func_id = normalize_id(&format!("{}_{}", name, arity));
+        let local_id = normalize_id(&format!("{}_{}", name, arity));
+        let func_id = scoped_id(&module_id, &local_id);
         let line = node_line(clause);
 
         if seen.insert(func_id.clone()) {
-            let visibility = if !has_module || exported.contains(&func_id) {
+            let visibility = if !has_module || exported.contains(&local_id) {
                 "public"
             } else {
                 "private"
@@ -1596,6 +2230,16 @@ fn emit_prolog_predicate(
         vec![
             FactValue::String(func_id.to_string()),
             FactValue::Integer(line as i64),
+        ],
+    ));
+
+    // The file directly: a method's module is its class, whose module/5 path
+    // is `class:Name`, so the module join cannot locate it.
+    ctx.facts.push(Fact::new(
+        "function_file",
+        vec![
+            FactValue::String(func_id.to_string()),
+            FactValue::String(ctx.filepath.to_string()),
         ],
     ));
     ctx.facts.push(Fact::new(
@@ -1850,6 +2494,19 @@ fn is_simple_receiver(node: &Node<'_>) -> bool {
 /// (contains a newline or `(`) down to a clean trailing symbol.  Defends every
 /// node-kind we didn't special-case across languages.
 fn sanitize_callee(text: &str) -> String {
+    // `await f<T>()` and `new X<T>()` name f and X: drop the keyword and any
+    // type arguments before anything else.
+    let text = text.trim();
+    let text = text
+        .strip_prefix("await ")
+        .or_else(|| text.strip_prefix("new "))
+        .unwrap_or(text)
+        .trim();
+    let text = match text.find('<') {
+        Some(i) => &text[..i],
+        None => text,
+    };
+
     if !text.contains('\n') && !text.contains('(') {
         return text.trim().to_string();
     }
@@ -2080,37 +2737,39 @@ room_accessible(P, R) :- relation(P, in_room, R).
         let funcs: Vec<&String> = result
             .facts
             .iter()
-            .filter(|f| f.starts_with("function('room_accessible_2'"))
+            .filter(|f| f.starts_with("function('dungeon__room_accessible_2'"))
             .collect();
         assert_eq!(funcs.len(), 1, "predicate should be deduped: {funcs:?}");
 
         // Exported predicate is public; non-exported is private.
         assert!(
-            facts.contains("function('room_accessible_2', 'dungeon', 'room_accessible', 2, public"),
+            facts.contains(
+                "function('dungeon__room_accessible_2', 'dungeon', 'room_accessible', 2, public"
+            ),
             "exported pred should be public: {facts}"
         );
         assert!(
-            facts.contains("function('relation_3', 'dungeon', 'relation', 3, private"),
+            facts.contains("function('dungeon__relation_3', 'dungeon', 'relation', 3, private"),
             "non-exported pred should be private: {facts}"
         );
 
         // Head variables become positional params.
         assert!(
-            facts.contains("function_param('room_accessible_2', 0, 'P', unknown)"),
+            facts.contains("function_param('dungeon__room_accessible_2', 0, 'P', unknown)"),
             "param P missing: {facts}"
         );
         assert!(
-            facts.contains("function_param('room_accessible_2', 1, 'R', unknown)"),
+            facts.contains("function_param('dungeon__room_accessible_2', 1, 'R', unknown)"),
             "param R missing: {facts}"
         );
 
         // Body goals become calls (functor of each goal).
         assert!(
-            facts.contains("calls_external('room_accessible_2', 'unknown', 'attribute'"),
+            facts.contains("calls_external('dungeon__room_accessible_2', 'unknown', 'attribute'"),
             "attribute call missing: {facts}"
         );
         assert!(
-            facts.contains("calls_external('room_accessible_2', 'unknown', 'relation'"),
+            facts.contains("calls_external('dungeon__room_accessible_2', 'unknown', 'relation'"),
             "relation call missing: {facts}"
         );
 
@@ -2118,7 +2777,7 @@ room_accessible(P, R) :- relation(P, in_room, R).
         let lines = result
             .facts
             .iter()
-            .filter(|f| f.starts_with("function_line('room_accessible_2'"))
+            .filter(|f| f.starts_with("function_line('dungeon__room_accessible_2'"))
             .count();
         assert_eq!(lines, 2, "expected a line per clause: {facts}");
 
@@ -2139,16 +2798,16 @@ room_accessible(P, R) :- relation(P, in_room, R).
         let facts = result.facts.join("\n");
         // No module directive → predicates default public.
         assert!(
-            facts.contains("function('heads_0', 'coin', 'heads', 0, public"),
+            facts.contains("function('coin__heads_0', 'coin', 'heads', 0, public"),
             "problog head 'heads' missing: {facts}"
         );
         assert!(
-            facts.contains("function('rains_0', 'coin', 'rains', 0, public"),
+            facts.contains("function('coin__rains_0', 'coin', 'rains', 0, public"),
             "problog fact 'rains' missing: {facts}"
         );
         // The annotated rule's body goal is a call.
         assert!(
-            facts.contains("calls_external('heads_0', 'unknown', 'toss'"),
+            facts.contains("calls_external('coin__heads_0', 'unknown', 'toss'"),
             "toss call missing: {facts}"
         );
     }
@@ -2168,15 +2827,15 @@ room_accessible(P, R) :- relation(P, in_room, R).
         // A fact predicate gets arity + positional params from the head args.
         let f = prolog_facts("relation(entrance, connects_to, hall).\n");
         assert!(
-            f.contains("function('relation_3', 'm', 'relation', 3, public"),
+            f.contains("function('m__relation_3', 'm', 'relation', 3, public"),
             "relation/3 fact pred missing: {f}"
         );
         assert!(
-            f.contains("function_param('relation_3', 0,"),
+            f.contains("function_param('m__relation_3', 0,"),
             "positional param 0 missing: {f}"
         );
         assert!(
-            f.contains("function_param('relation_3', 2,"),
+            f.contains("function_param('m__relation_3', 2,"),
             "positional param 2 missing: {f}"
         );
     }
@@ -2185,7 +2844,7 @@ room_accessible(P, R) :- relation(P, in_room, R).
     fn prolog_negation_records_inner_goal_call() {
         let f = prolog_facts("safe(X) :- \\+ forbidden(X).\n");
         assert!(
-            f.contains("calls_external('safe_1', 'unknown', 'forbidden'"),
+            f.contains("calls_external('m__safe_1', 'unknown', 'forbidden'"),
             "negated inner goal should be a call: {f}"
         );
     }
@@ -2195,7 +2854,7 @@ room_accessible(P, R) :- relation(P, in_room, R).
         let f = prolog_facts("pick(X) :- ( cond(X) -> yes(X) ; no(X) ).\n");
         for goal in ["cond", "yes", "no"] {
             assert!(
-                f.contains(&format!("calls_external('pick_1', 'unknown', '{goal}'")),
+                f.contains(&format!("calls_external('m__pick_1', 'unknown', '{goal}'")),
                 "branch goal {goal} missing: {f}"
             );
         }
@@ -2206,7 +2865,7 @@ room_accessible(P, R) :- relation(P, in_room, R).
         // `lists:member(...)` — the callee is `member`, not the `:` qualifier.
         let f = prolog_facts("has(X, L) :- lists:member(X, L).\n");
         assert!(
-            f.contains("calls_external('has_2', 'unknown', 'member'"),
+            f.contains("calls_external('m__has_2', 'unknown', 'member'"),
             "module-qualified callee should be 'member': {f}"
         );
         assert!(
@@ -2229,7 +2888,7 @@ room_accessible(P, R) :- relation(P, in_room, R).
         );
         // The actual predicate is still picked up.
         assert!(
-            f.contains("function('counter_1'"),
+            f.contains("function('m__counter_1'"),
             "counter/1 predicate missing: {f}"
         );
     }
@@ -2238,7 +2897,7 @@ room_accessible(P, R) :- relation(P, in_room, R).
     fn prolog_quoted_atom_predicate_name_is_unquoted() {
         let f = prolog_facts("'$secret'(X) :- p(X).\n");
         assert!(
-            f.contains("function('_secret_1', 'm', '$secret', 1"),
+            f.contains("function('m___secret_1', 'm', '$secret', 1"),
             "quoted atom name should be unquoted in name slot: {f}"
         );
     }
@@ -2247,15 +2906,15 @@ room_accessible(P, R) :- relation(P, in_room, R).
     fn prolog_cut_and_infix_goals_are_calls() {
         let f = prolog_facts("g(X, Y) :- p(X), !, Y is X + 1.\n");
         assert!(
-            f.contains("calls_external('g_2', 'unknown', 'p'"),
+            f.contains("calls_external('m__g_2', 'unknown', 'p'"),
             "p call missing: {f}"
         );
         assert!(
-            f.contains("calls_external('g_2', 'unknown', '!'"),
+            f.contains("calls_external('m__g_2', 'unknown', '!'"),
             "cut should be recorded as a goal: {f}"
         );
         assert!(
-            f.contains("calls_external('g_2', 'unknown', 'is'"),
+            f.contains("calls_external('m__g_2', 'unknown', 'is'"),
             "infix `is` goal should be a call: {f}"
         );
     }
@@ -2264,7 +2923,7 @@ room_accessible(P, R) :- relation(P, in_room, R).
     fn prolog_dcg_head_becomes_predicate() {
         let f = prolog_facts("greeting --> [hello], [world].\n");
         assert!(
-            f.contains("function('greeting_0', 'm', 'greeting', 0"),
+            f.contains("function('m__greeting_0', 'm', 'greeting', 0"),
             "DCG head predicate missing: {f}"
         );
     }
@@ -2795,29 +3454,29 @@ pub fn run() {}
 
         // Both Order::new and OrderItem::new must coexist as distinct ids.
         assert!(
-            ids.contains(&"order_new_0"),
-            "expected order_new_0 in {ids:?}"
+            ids.contains(&"src__order__order_new_0"),
+            "expected src__order__order_new_0 in {ids:?}"
         );
         assert!(
-            ids.contains(&"orderitem_new_0"),
-            "expected orderitem_new_0 in {ids:?}"
+            ids.contains(&"src__order__orderitem_new_0"),
+            "expected src__order__orderitem_new_0 in {ids:?}"
         );
 
         // Same for the cancel methods — they have the same arity but different
         // Self types and must not collide.
         assert!(
-            ids.contains(&"order_cancel_1"),
-            "expected order_cancel_1 in {ids:?}"
+            ids.contains(&"src__order__order_cancel_1"),
+            "expected src__order__order_cancel_1 in {ids:?}"
         );
         assert!(
-            ids.contains(&"orderitem_cancel_1"),
-            "expected orderitem_cancel_1 in {ids:?}"
+            ids.contains(&"src__order__orderitem_cancel_1"),
+            "expected src__order__orderitem_cancel_1 in {ids:?}"
         );
 
-        // The free function `run` keeps the legacy unqualified form.
+        // The free function `run` is scoped by its module alone.
         assert!(
-            ids.contains(&"run_0"),
-            "free function run should remain unqualified, got {ids:?}"
+            ids.contains(&"src__order__run_0"),
+            "free function run should be module-scoped, got {ids:?}"
         );
 
         // And there should be NO bare `new_0` id (would indicate collision).

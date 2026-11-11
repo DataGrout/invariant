@@ -4,15 +4,17 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use datagrout_conduit::OnrampOptions;
+use futures::stream::{self, StreamExt};
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use invariant_core::{
-    bridge::{Bridge, DiffAnalysis},
+    bridge::{lens_tag, Bridge, DiffAnalysis},
     git::{self, DiffStatus, FileDiff},
+    lens_state::{code_namespace, LensState},
     patch, Analyzer, Config, Language,
 };
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "invariant")]
@@ -51,6 +53,19 @@ enum Commands {
         /// Skip uploading to DataGrout (local analysis only)
         #[arg(long)]
         local_only: bool,
+
+        /// Logic-cell namespace for the facts (default: `code_<repo>`)
+        #[arg(long)]
+        namespace: Option<String>,
+
+        /// Re-upload every file, not just the ones that changed
+        #[arg(long)]
+        full: bool,
+
+        /// Also send changed files' source to invariant.code_lens for LLM
+        /// intent enrichment (costs credits; source leaves the machine)
+        #[arg(long)]
+        enrich: bool,
     },
 
     /// Execute queries over analyzed facts via DataGrout Invariant
@@ -61,6 +76,10 @@ enum Commands {
         /// Commit SHA to query (defaults to HEAD)
         #[arg(long)]
         commit: Option<String>,
+
+        /// Logic-cell namespace to query (default: the one `lens` last used)
+        #[arg(long)]
+        namespace: Option<String>,
 
         /// Output format
         #[arg(long, default_value = "text")]
@@ -218,7 +237,7 @@ async fn try_bridge(config: &Config) -> Option<Bridge> {
 
 /// Walk a directory and collect files with recognized extensions,
 /// respecting `.gitignore` and `.ignore` files automatically.
-fn collect_files(path: &PathBuf) -> Vec<PathBuf> {
+fn collect_files(path: &PathBuf, ignore_patterns: &[String]) -> Vec<PathBuf> {
     WalkBuilder::new(path)
         .hidden(true)
         .git_ignore(true)
@@ -227,6 +246,12 @@ fn collect_files(path: &PathBuf) -> Vec<PathBuf> {
         .build()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter(|e| {
+            !e.path().components().any(|c| {
+                let part = c.as_os_str().to_string_lossy();
+                ignore_patterns.iter().any(|p| p == part.as_ref())
+            })
+        })
         .filter(|e| {
             e.path()
                 .extension()
@@ -263,12 +288,30 @@ async fn main() -> Result<()> {
             paths,
             language,
             local_only,
-        } => cmd_lens(&config, paths, language, local_only).await?,
+            namespace,
+            full,
+            enrich,
+        } => {
+            let opts = LensOpts {
+                paths,
+                language_filter: language,
+                local_only,
+                namespace,
+                full,
+                enrich,
+            };
+            cmd_lens(&project_root, &config, opts).await?
+        }
         Commands::Query {
             query,
             commit,
+            namespace,
             output,
-        } => cmd_query(&config, query, commit, output).await?,
+        } => {
+            let namespace =
+                namespace.or_else(|| LensState::lensed_namespace(&project_root.join(".invariant")));
+            cmd_query(&config, query, commit, namespace, output).await?
+        }
         Commands::Diff {
             rev,
             patch,
@@ -290,7 +333,10 @@ async fn main() -> Result<()> {
             goal,
             queries,
             output,
-        } => cmd_review(&config, rev, goal, queries, output).await?,
+        } => {
+            let namespace = LensState::lensed_namespace(&project_root.join(".invariant"));
+            cmd_review(&config, rev, goal, queries, namespace, output).await?
+        }
         Commands::Status => cmd_status(&config),
         Commands::Onboard { name, agent } => {
             cmd_onboard(&project_root, config, name, agent).await?
@@ -334,7 +380,34 @@ async fn cmd_init(
 
             match Bridge::connect(url).await {
                 Ok(_) => println!("  {} Connection verified", "✓".green()),
-                Err(e) => println!("  {} Connection test failed: {}", "⚠".yellow(), e),
+                // An identity in ~/.conduit can belong to another account or
+                // gateway. Dropping the token here left `lens` with no way in,
+                // and it quietly stayed local.
+                Err(e) => match token {
+                    Some(token) => match Bridge::connect_with_token(url, &token).await {
+                        Ok(_) => {
+                            config.access_token = Some(token);
+                            println!(
+                                "  {} The mTLS identity was refused here ({}); connected with the token instead, and saved it",
+                                "✓".green(),
+                                e
+                            );
+                        }
+                        Err(token_err) => println!(
+                            "  {} Connection failed with the mTLS identity ({}) and with the token ({})",
+                            "✗".red(),
+                            e,
+                            token_err
+                        ),
+                    },
+                    None => {
+                        println!("  {} Connection test failed: {}", "⚠".yellow(), e);
+                        println!(
+                            "  {} If this identity belongs to another account, rerun with --token <access token>",
+                            "hint:".yellow()
+                        );
+                    }
+                },
             }
         } else if let Some(token) = token {
             println!("  {} Bootstrapping mTLS identity...", "→".cyan());
@@ -471,25 +544,60 @@ async fn cmd_init(
     Ok(())
 }
 
-async fn cmd_lens(
-    config: &Config,
+struct LensOpts {
     paths: Vec<PathBuf>,
     language_filter: Option<String>,
     local_only: bool,
-) -> Result<()> {
+    namespace: Option<String>,
+    full: bool,
+    enrich: bool,
+}
+
+/// A file `lens` analysed and has yet to upload.
+struct PendingUpload {
+    rel: String,
+    hash: String,
+    facts: Vec<String>,
+    /// The source, kept only for `--enrich`, which sends it.
+    code: Option<String>,
+    language: Language,
+}
+
+/// Files uploaded at once by `lens`. The server applies one namespace's writes
+/// in turn, so more than a few only queue there; a few hide the round trips.
+const UPLOAD_CONCURRENCY: usize = 4;
+
+/// Lens the repository into its logic-cell namespace.
+///
+/// The tree-sitter facts extracted here are what gets uploaded: each file's
+/// facts under its own tag, replaced when the file's content hash changes and
+/// retracted when the file is gone. Unchanged files cost nothing, and no
+/// source leaves the machine unless `--enrich` asks for LLM intent.
+async fn cmd_lens(project_root: &Path, config: &Config, opts: LensOpts) -> Result<()> {
     let mut analyzer = Analyzer::new()?;
-    let bridge = if local_only {
+    let bridge = if opts.local_only {
         None
     } else {
         try_bridge(config).await
     };
 
     let (repo_id, commit_sha) = detect_repo_context();
+    let repo_id = config.repo_id.clone().unwrap_or(repo_id);
+    let namespace = opts
+        .namespace
+        .clone()
+        .unwrap_or_else(|| code_namespace(&repo_id));
 
-    let scan_paths = if paths.is_empty() {
-        vec![PathBuf::from(".")]
+    let invariant_dir = project_root.join(".invariant");
+    let mut state = LensState::load(&invariant_dir, &namespace);
+
+    // A whole-tree lens is the only run that can tell a deleted file from
+    // one that simply wasn't asked about.
+    let whole_tree = opts.paths.is_empty();
+    let scan_paths = if whole_tree {
+        vec![project_root.to_path_buf()]
     } else {
-        paths
+        opts.paths.clone()
     };
 
     let mut files_to_lens: Vec<PathBuf> = Vec::new();
@@ -497,11 +605,11 @@ async fn cmd_lens(
         if path.is_file() {
             files_to_lens.push(path.clone());
         } else if path.is_dir() {
-            files_to_lens.extend(collect_files(path));
+            files_to_lens.extend(collect_files(path, &config.ignore_patterns));
         }
     }
 
-    if let Some(ref filter) = language_filter {
+    if let Some(ref filter) = opts.language_filter {
         let filter_lower = filter.to_lowercase();
         files_to_lens.retain(|f| {
             f.extension()
@@ -518,6 +626,7 @@ async fn cmd_lens(
         files_to_lens.len()
     );
     println!("  {} {}", "Repo:".green(), repo_id);
+    println!("  {} {}", "Namespace:".green(), namespace);
     println!(
         "  {} {}",
         "Commit:".green(),
@@ -532,73 +641,188 @@ async fn cmd_lens(
             .progress_chars("##-"),
     );
 
+    let mut present: Vec<String> = Vec::new();
     let mut total_functions = 0;
     let mut total_facts = 0;
+    let mut changed = 0;
+    let mut unchanged = 0;
     let mut uploaded = 0;
+    let mut enriched = 0;
     let mut errors = 0;
 
+    // Analysis runs here, file by file; uploads wait in `pending` and go out
+    // UPLOAD_CONCURRENCY at a time below. Serial, each file waited on its own
+    // round trips (forget, then assert), and the network was most of a lens.
+    let mut pending: Vec<PendingUpload> = Vec::new();
+
     for file_path in &files_to_lens {
-        pb.set_message(format!("{}", file_path.display()));
+        let rel = relative_path(project_root, file_path);
+        pb.set_message(rel.clone());
+        pb.inc(1);
 
-        if let Some(ext) = file_path.extension().and_then(|s| s.to_str()) {
-            if let Some(language) = Language::from_extension(ext) {
-                match std::fs::read_to_string(file_path) {
-                    Ok(code) => {
-                        match analyzer.lens_code(
-                            &code,
-                            language,
-                            file_path.to_str().unwrap_or("unknown"),
-                            &commit_sha,
-                        ) {
-                            Ok(result) => {
-                                total_functions += result.summary.functions;
-                                total_facts += result.facts.len();
+        let Some(language) = file_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .and_then(Language::from_extension)
+        else {
+            continue;
+        };
 
-                                if let Some(ref b) = bridge {
-                                    if b.upload_facts(
-                                        &code,
-                                        language.name(),
-                                        file_path.to_str().unwrap_or("unknown"),
-                                        &commit_sha,
-                                        Some(&repo_id),
-                                    )
-                                    .await
-                                    .is_ok()
-                                    {
-                                        uploaded += 1;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!("Failed to analyze {}: {}", file_path.display(), e);
-                                errors += 1;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Failed to read {}: {}", file_path.display(), e);
-                        errors += 1;
-                    }
-                }
+        let code = match std::fs::read_to_string(file_path) {
+            Ok(code) => code,
+            Err(e) => {
+                tracing::debug!("Failed to read {}: {}", rel, e);
+                errors += 1;
+                continue;
             }
+        };
+
+        present.push(rel.clone());
+        let hash = analyzer.compute_checksum(&code);
+
+        if !opts.full && bridge.is_some() && state.unchanged(&rel, &hash) {
+            unchanged += 1;
+            continue;
         }
 
-        pb.inc(1);
+        let result = match analyzer.lens_code(&code, language, &rel, &commit_sha) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::debug!("Failed to analyze {}: {}", rel, e);
+                errors += 1;
+                continue;
+            }
+        };
+
+        changed += 1;
+        total_functions += result.summary.functions;
+        total_facts += result.facts.len();
+
+        if bridge.is_some() {
+            pending.push(PendingUpload {
+                rel,
+                hash,
+                facts: result.facts,
+                code: opts.enrich.then_some(code),
+                language,
+            });
+        }
     }
 
-    pb.finish_with_message("Done!");
+    pb.finish_and_clear();
+
+    if let Some(ref b) = bridge {
+        let ns = namespace.as_str();
+        let up = ProgressBar::new(pending.len() as u64);
+        up.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} uploading")
+                .unwrap()
+                .progress_chars("##-"),
+        );
+
+        let results: Vec<_> = stream::iter(pending)
+            .map(
+                |PendingUpload {
+                     rel,
+                     hash,
+                     facts,
+                     code,
+                     language,
+                 }| {
+                    let commit = commit_sha.as_str();
+                    let repo = repo_id.as_str();
+                    let enrich = opts.enrich;
+                    let up = &up;
+                    async move {
+                        let tag = lens_tag(&rel);
+                        // Replace, never append: the file's previous facts go first.
+                        let uploaded = async {
+                            b.forget_tag(ns, &tag).await?;
+                            b.assert_clauses(ns, &tag, &facts).await
+                        }
+                        .await;
+
+                        let enriched = match (&code, &uploaded) {
+                            (Some(code), Ok(_)) if enrich => b
+                                .upload_facts(code, language.name(), &rel, commit, Some(repo))
+                                .await
+                                .is_ok(),
+                            _ => false,
+                        };
+
+                        up.inc(1);
+                        (rel, hash, uploaded, enriched)
+                    }
+                },
+            )
+            .buffer_unordered(UPLOAD_CONCURRENCY)
+            .collect()
+            .await;
+
+        up.finish_and_clear();
+
+        for (rel, hash, outcome, was_enriched) in results {
+            match outcome {
+                Ok(n) => {
+                    uploaded += n;
+                    state.files.insert(rel, hash);
+                }
+                Err(e) => {
+                    tracing::warn!("Upload failed for {}: {:#}", rel, e);
+                    errors += 1;
+                }
+            }
+            if was_enriched {
+                enriched += 1;
+            }
+        }
+    }
+
+    let mut retracted = 0;
+    if let (Some(ref b), true) = (&bridge, whole_tree) {
+        let gone: Vec<String> = state.vanished(&present).cloned().collect();
+        for rel in gone {
+            match b.forget_tag(&namespace, &lens_tag(&rel)).await {
+                Ok(()) => {
+                    state.files.remove(&rel);
+                    retracted += 1;
+                }
+                Err(e) => tracing::warn!("Retract failed for {}: {:#}", rel, e),
+            }
+        }
+    }
+
+    if bridge.is_some() {
+        state.save(&invariant_dir)?;
+    }
 
     println!(
-        "\n{} {} files",
+        "{} {} files",
         "Analyzed".green().bold(),
         files_to_lens.len()
     );
     println!("  Functions: {}", total_functions);
     println!("  Facts:     {}", total_facts);
 
-    if uploaded > 0 {
-        println!("  {} {} files uploaded to Invariant", "↑".cyan(), uploaded);
-    } else if bridge.is_none() && !local_only {
+    if bridge.is_some() {
+        println!(
+            "  {} {} changed, {} unchanged, {} removed; {} facts into {}",
+            "↑".cyan(),
+            changed,
+            unchanged,
+            retracted,
+            uploaded,
+            namespace
+        );
+        if opts.enrich {
+            println!(
+                "  {} {} files sent for intent enrichment",
+                "✦".cyan(),
+                enriched
+            );
+        }
+    } else if !opts.local_only {
         println!(
             "  {} Run `invariant init` to enable remote analysis",
             "hint:".yellow()
@@ -616,10 +840,28 @@ async fn cmd_lens(
     Ok(())
 }
 
+/// A lensed file's path relative to the project root, `/`-separated: the
+/// key for its tag and its recorded hash, so it must not depend on where the
+/// command ran from.
+fn relative_path(project_root: &Path, file: &Path) -> String {
+    let root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let full = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+
+    full.strip_prefix(&root)
+        .unwrap_or(&full)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 async fn cmd_query(
     config: &Config,
     query_name: String,
     commit: Option<String>,
+    namespace: Option<String>,
     output: OutputFormat,
 ) -> Result<()> {
     let bridge = require_bridge(config).await?;
@@ -634,8 +876,17 @@ async fn cmd_query(
         &commit_sha[..std::cmp::min(8, commit_sha.len())]
     );
 
+    if let Some(ref ns) = namespace {
+        println!("  {} {}", "Namespace:".green(), ns);
+    }
+
     let result = bridge
-        .query(&repo_id, &query_name, Some(&commit_sha))
+        .query(
+            &repo_id,
+            &query_name,
+            Some(&commit_sha),
+            namespace.as_deref(),
+        )
         .await?;
 
     match output {
@@ -922,6 +1173,7 @@ async fn cmd_review(
     rev: Option<String>,
     goal: String,
     queries: Vec<String>,
+    namespace: Option<String>,
     output: OutputFormat,
 ) -> Result<()> {
     let diffs = git::diff_from_spec(rev.as_deref())?;
@@ -1035,7 +1287,15 @@ async fn cmd_review(
     );
 
     for query_name in &query_names {
-        match bridge.query(&repo_id, query_name, Some(&commit_sha)).await {
+        match bridge
+            .query(
+                &repo_id,
+                query_name,
+                Some(&commit_sha),
+                namespace.as_deref(),
+            )
+            .await
+        {
             Ok(result) => match output {
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&result)?);

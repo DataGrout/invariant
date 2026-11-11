@@ -763,3 +763,285 @@ function App(): JSX.Element {
     assert!(result.summary.functions >= 1);
     assert!(has_fact(&result.facts, "'App'"), "App component not found");
 }
+
+// ─── Calibration fixes (testbed, 2026-11-09) ─────────────────────────────────
+
+fn lens(code: &str, lang: Language, path: &str) -> Vec<String> {
+    let mut analyzer = Analyzer::new().unwrap();
+    analyzer.lens_code(code, lang, path, "sha").unwrap().facts
+}
+
+fn count_prefix(facts: &[String], prefix: &str) -> usize {
+    facts.iter().filter(|f| f.starts_with(prefix)).count()
+}
+
+#[test]
+fn tests_are_marked_as_tests() {
+    let rust = lens(
+        "fn helper() {}\n#[test]\nfn checks_helper() { helper(); }\n",
+        Language::Rust,
+        "src/lib.rs",
+    );
+    assert!(has_fact(
+        &rust,
+        "test('src__lib__checks_helper_0', '', unit)."
+    ));
+    assert!(!has_fact(&rust, "test('src__lib__helper_0'"));
+
+    let py = lens(
+        "def test_add():\n    pass\n\ndef make():\n    pass\n",
+        Language::Python,
+        "tests/test_math.py",
+    );
+    assert!(has_fact(
+        &py,
+        "test('tests_test_math__test_add_0', '', unit)."
+    ));
+    assert!(has_fact(
+        &py,
+        "test('tests_test_math__make_0', '', test_helper)."
+    ));
+
+    let prod = lens(
+        "def test_mode():\n    pass\n",
+        Language::Python,
+        "app/config.py",
+    );
+    assert_eq!(
+        count_prefix(&prod, "test("),
+        0,
+        "a test-like name outside test files is not a test"
+    );
+}
+
+#[test]
+fn rust_inline_modules_and_trait_defaults_are_read() {
+    let facts = lens(
+        r#"
+use regex_syntax::hir::{self, Hir};
+trait Greet { fn name(&self) -> String; fn hello(&self) -> String { self.name() } }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() { assert!(true); }
+}
+"#,
+        Language::Rust,
+        "src/greet.rs",
+    );
+    assert!(has_fact(&facts, "'hello', 1"), "trait default method");
+    assert!(
+        !has_fact(&facts, "'name', 1, public"),
+        "a required method has no body"
+    );
+    assert!(
+        has_fact(&facts, "'src__greet__tests__it_works_0'"),
+        "inline mod item"
+    );
+    assert!(has_fact(
+        &facts,
+        "depends_on('src__greet', 'regex_syntax.hir', use"
+    ));
+    assert!(
+        !facts.iter().any(|f| f.contains("hir.{")),
+        "grouped use is not split on spaces"
+    );
+    assert!(
+        !has_fact(&facts, "'tests', mod"),
+        "an inline mod is not a dependency"
+    );
+    assert!(has_fact(
+        &facts,
+        "depends_on('src__greet', 'regex_syntax.hir.Hir', use"
+    ));
+    assert!(has_fact(
+        &facts,
+        "test('src__greet__tests__it_works_0', '', unit)."
+    ));
+}
+
+#[test]
+fn go_methods_are_scoped_by_receiver_and_types_are_types() {
+    let facts = lens(
+        r#"
+package render
+type JSON struct{}
+type IndentedJSON struct{}
+func (r JSON) Render(w int) error { return nil }
+func (r *IndentedJSON) Render(w int) error { return nil }
+"#,
+        Language::Go,
+        "render/json.go",
+    );
+    assert!(has_fact(&facts, "'render_json__json_render_1'"));
+    assert!(has_fact(&facts, "'render_json__indentedjson_render_1'"));
+    assert!(!facts
+        .iter()
+        .any(|f| f.starts_with("depends_on") && f.contains("JSON")));
+}
+
+#[test]
+fn elixir_guards_macros_and_clauses() {
+    let facts = lens(
+        r#"
+defmodule Outer do
+  defmodule Inner do
+    def f(x) when is_integer(x), do: x
+    def f(x), do: g(x)
+    defmacro m(ast), do: ast
+  end
+end
+"#,
+        Language::Elixir,
+        "lib/outer.ex",
+    );
+    assert_eq!(
+        count_prefix(&facts, "function('outer_inner__f_1'"),
+        1,
+        "one function for two clauses"
+    );
+    assert!(
+        has_fact(&facts, "'outer_inner__m_1'"),
+        "defmacro is a function"
+    );
+    assert!(!facts.iter().any(|f| f.contains("when is_integer")));
+    assert!(has_fact(
+        &facts,
+        "calls_external('outer_inner__f_1', 'unknown', 'g'"
+    ));
+}
+
+#[test]
+fn javascript_functions_take_their_binding_names() {
+    let facts = lens(
+        r#"
+const add = (a, b) => a + b;
+View.prototype.lookup = function lookup(name) { return name; };
+const api = { fetchUser: async (id) => load(id) };
+function outer() {
+  function inner() { return helper(); }
+  return [1, 2].map(x => compute(x)).concat(new Thing());
+}
+const lodash = require("lodash");
+import "./styles.css";
+"#,
+        Language::JavaScript,
+        "src/app.js",
+    );
+    assert!(has_fact(&facts, "'src_app__add_2'"));
+    assert!(has_fact(&facts, "'src_app__lookup_1'"));
+    assert!(has_fact(&facts, "'src_app__fetchuser_1'"));
+    assert!(
+        has_fact(&facts, "'src_app__outer_0__inner_0'"),
+        "nested named function"
+    );
+    assert!(
+        has_fact(
+            &facts,
+            "calls_external('src_app__outer_0', 'unknown', 'compute'"
+        ),
+        "an inline callback's calls are the outer function's"
+    );
+    assert!(
+        has_fact(
+            &facts,
+            "calls_external('src_app__outer_0', 'unknown', 'Thing'"
+        ),
+        "new X calls X"
+    );
+    assert!(has_fact(
+        &facts,
+        "calls_external('src_app__outer_0__inner_0', 'unknown', 'helper'"
+    ));
+    assert!(!has_fact(
+        &facts,
+        "calls_external('src_app__outer_0', 'unknown', 'helper'"
+    ));
+    assert!(has_fact(&facts, "'lodash', require"));
+    assert!(has_fact(&facts, "'./styles.css', import"));
+    assert!(!facts.iter().any(|f| f.contains("'anonymous'")));
+}
+
+#[test]
+fn typescript_namespaces_scope_their_functions() {
+    let facts = lens(
+        r#"
+export namespace Range { export function from(x: number) { return x; } }
+export namespace Position { export function from(x: number) { return x; } }
+"#,
+        Language::TypeScript,
+        "src/converters.ts",
+    );
+    assert!(has_fact(&facts, "'src_converters__range__from_1'"));
+    assert!(has_fact(&facts, "'src_converters__position__from_1'"));
+}
+
+#[test]
+fn python_nested_functions_are_their_own() {
+    let facts = lens(
+        "def keep_lazy(f):\n    def decorator(g):\n        return wrap(g)\n    return decorator\n\ndef keep_lazy(f):\n    return f\n",
+        Language::Python,
+        "utils/functional.py",
+    );
+    assert!(has_fact(
+        &facts,
+        "'utils_functional__keep_lazy_1__decorator_1'"
+    ));
+    assert!(has_fact(
+        &facts,
+        "calls_external('utils_functional__keep_lazy_1__decorator_1', 'unknown', 'wrap'"
+    ));
+    assert!(!has_fact(
+        &facts,
+        "calls_external('utils_functional__keep_lazy_1', 'unknown', 'wrap'"
+    ));
+    assert!(
+        has_fact(&facts, "'utils_functional__keep_lazy_1_l6'"),
+        "a redefinition is a second function"
+    );
+}
+
+#[test]
+fn ruby_include_reads_constants_only_and_atoms_are_quoted() {
+    let facts = lens(
+        "class Cookies\n  include Comparable\n  include(Enumerable)\n  def check\n    expect(x).to include(\"foo=;\", \"bar\")\n  end\nend\n",
+        Language::Ruby,
+        "spec/cookies_spec.rb",
+    );
+    assert!(has_fact(&facts, "'Comparable', include"));
+    assert!(has_fact(&facts, "'Enumerable', include"));
+    assert!(
+        !facts.iter().any(|f| f.contains("foo=;")),
+        "an RSpec matcher is not a mixin"
+    );
+    for f in &facts {
+        assert!(!f.contains(",,"), "malformed fact: {f}");
+    }
+}
+
+#[test]
+fn ruby_bare_calls_and_file_scoped_modules() {
+    let facts = lens(
+        "module Concern\n  module ClassMethods\n    def build(opts)\n      total = 1\n      [1].each { |x| x }\n      app\n      configure(total, opts)\n    end\n  end\nend\n",
+        Language::Ruby,
+        "lib/concern.rb",
+    );
+    let calls: Vec<&String> = facts
+        .iter()
+        .filter(|f| f.starts_with("calls_external("))
+        .collect();
+    let called = |n: &str| {
+        calls
+            .iter()
+            .any(|f| f.contains(&format!("'unknown', '{n}'")))
+    };
+    assert!(called("app"), "a bare method name is a call: {calls:?}");
+    assert!(called("configure"));
+    assert!(!called("total"), "a local is not a call");
+    assert!(!called("opts"), "a parameter is not a call");
+    assert!(!called("x"), "a block parameter is not a call");
+    assert!(
+        has_fact(&facts, "module('lib_concern_rb__classmethods'"),
+        "modules are scoped by file"
+    );
+}

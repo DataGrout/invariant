@@ -6,6 +6,70 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.0] - 2026-11-10
+
+### Changed (breaking)
+
+- **Function ids are scoped by module.** They were bare `name_arity`, so every
+  module's `new_0` or `save_1` collapsed into one node. Ids are now scoped by
+  module (classes and Ruby modules by file), stay unique within a file (a line
+  suffix on a rebinding), and every function carries `function_file/2`. Facts
+  stored by earlier versions use the old ids; re-lens with `--full`.
+- **`lens` uploads the facts it extracts, not your source.** Each file's facts
+  go into the `code_<repo>` logic-cell namespace (or `--namespace`) under their
+  own `lens_<path>` tag, replaced when the file's content hash changes and
+  retracted when the file is gone. `.invariant/lens_state.json` records the
+  hashes, so later runs skip unchanged files (`--full` re-uploads all).
+  Sending source for LLM intent is now opt-in with `--enrich`. `ignore_patterns`
+  apply to the walk.
+
+### Added
+
+- `query` and `review` read the namespace `lens` last wrote; `--namespace`
+  overrides.
+- A query result DataGrout returns as a preview plus a cache reference is read
+  back in full (paged with `frame.slice`), not cut at the preview.
+- `test(Func, '', unit|test_helper)` facts for `#[test]` functions, test-named
+  functions in test files and plunit clauses, so `orphans` stops listing tests.
+- `.mjs`, `.cjs`, `.mts` and `.cts` files.
+
+### Improved extraction
+
+Measured on a 32-repository testbed against hand-checked ground truth
+(precision/recall before and after): TypeScript 100/93 to 100/100, TSX 82/41
+to 100/100, JavaScript 100/55 to 100/100, Python 78/90 to 100/100, Go 82/73 to
+100/100, Elixir 91/69 to 100/93, Rust 77/45 to 97/82, Ruby recall 86 to 89.
+
+- **Rust:** items of inline `mod` blocks, trait default methods, and one
+  dependency per item of a `use` tree (`use a::{b, c::d}` depends on `a.b`
+  and `a.c.d`).
+- **Go:** methods scoped by receiver type; type declarations are types, not
+  dependencies.
+- **Elixir:** guard heads, `defmacro`/`defguard`/`defdelegate`, one fact per
+  multi-clause function, nested module names, one-line `do:` bodies; special
+  forms are not calls.
+- **JavaScript/TypeScript:** functions named by their binding, nested named
+  functions, inline callbacks' calls credited to the enclosing function,
+  namespaces as scopes, `new X` as a call, `require()` and side-effect
+  imports.
+- **Python:** nested `def`s are functions of their own.
+- **Ruby:** bare method calls (a name that is not a parameter or local), and
+  `include` reads only constant arguments.
+- Atoms that are not plain identifiers are quoted.
+
+### Fixed
+
+- `init --token` no longer drops the token when `~/.conduit` holds an identity
+  for another account; when that identity is refused, it connects with the
+  token and saves it.
+
+### Performance
+
+- `lens` analyses every file first, then uploads four at a time instead of
+  waiting on each file's round trips in turn.
+
+---
+
 ## [0.7.0] - 2026-07-21
 
 ### Added

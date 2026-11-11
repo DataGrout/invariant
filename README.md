@@ -111,8 +111,17 @@ invariant lens src/ lib/          # Analyze specific directories
 invariant lens --language python  # Filter by language
 invariant lens --language elixir  # Elixir support
 invariant lens --local-only       # Extract without uploading
+invariant lens --namespace my_ns  # Upload into a namespace other than code_<repo>
+invariant lens --full             # Re-upload every file, not only changed ones
+invariant lens --enrich           # Also send changed source for LLM intent (costs credits)
 invariant -v lens                 # Verbose output (debug logging)
 ```
+
+`lens` uploads the facts it extracts, not your source: each file's facts go
+into the `code_<repo>` logic-cell namespace under their own tag, replaced when
+the file changes and retracted when it is deleted. Content hashes in
+`.invariant/lens_state.json` let later runs skip unchanged files. Source leaves
+the machine only with `--enrich`.
 
 ### `invariant query <query>`
 
@@ -126,6 +135,7 @@ invariant query dependency_cycles    # Circular dependencies
 invariant query security_concerns   # Potential security issues
 invariant query hotspots             # High-complexity, high-change-rate functions
 invariant query summary              # Aggregate statistics
+invariant query orphans --namespace my_ns   # Query a namespace other than the one lens last wrote
 ```
 
 ### `invariant diff`
@@ -171,9 +181,9 @@ Show connection, identity, and configuration status.
 |------------|------------|------------------|
 | Python     | tree-sitter| `.py`, `.pyw`    |
 | Rust       | tree-sitter| `.rs`            |
-| TypeScript | tree-sitter| `.ts`            |
+| TypeScript | tree-sitter| `.ts`, `.mts`, `.cts` |
 | TSX        | tree-sitter| `.tsx`            |
-| JavaScript | tree-sitter| `.js`, `.jsx`    |
+| JavaScript | tree-sitter| `.js`, `.jsx`, `.mjs`, `.cjs` |
 | Go         | tree-sitter| `.go`            |
 | Elixir     | tree-sitter| `.ex`, `.exs`    |
 | Ruby       | tree-sitter| `.rb`, `.rake`, `.gemspec` |

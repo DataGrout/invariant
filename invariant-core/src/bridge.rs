@@ -18,6 +18,28 @@ use serde_json::json;
 const TOOL_CODE_LENS: &str = "data-grout@1/invariant.code_lens@1";
 const TOOL_CODE_QUERY: &str = "data-grout@1/invariant.code_query@1";
 const TOOL_DIFF_ANALYZER: &str = "data-grout@1/invariant.diff_analyzer@1";
+const TOOL_LOGIC_ASSERT: &str = "data-grout@1/logic.assert@1";
+const TOOL_LOGIC_FORGET: &str = "data-grout@1/logic.forget@1";
+const TOOL_FRAME_SLICE: &str = "data-grout@1/frame.slice@1";
+/// Under DataGrout's per-result row cap, so a page is never itself headed.
+const SLICE_PAGE: usize = 40;
+
+/// Clauses per `logic.assert` call: batched, and well under its payload cap.
+pub const ASSERT_BATCH: usize = 200;
+
+/// The per-file tag lens facts are asserted under, so one file's facts can be
+/// replaced or retracted without touching the rest. Same convention as
+/// Manifold's lens (`src/store.rs` → `lens_src_store_rs`), so either client
+/// can refresh a namespace the other built.
+pub fn lens_tag(path: &str) -> String {
+    let mut tag = String::with_capacity(path.len() + 5);
+    tag.push_str("lens_");
+    tag.extend(
+        path.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }),
+    );
+    tag
+}
 
 /// Connection to DataGrout via the Conduit SDK.
 pub struct Bridge {
@@ -162,14 +184,70 @@ impl Bridge {
         Ok(unwrap_mcp_content(result))
     }
 
+    /// Assert lens facts (Prolog clause strings) into a logic-cell namespace
+    /// under `tag`. Deterministic structure only: no LLM, no embeddings.
+    /// Returns how many clauses the server accepted.
+    pub async fn assert_clauses(
+        &self,
+        namespace: &str,
+        tag: &str,
+        clauses: &[String],
+    ) -> Result<usize> {
+        let mut accepted = 0;
+
+        for chunk in clauses.chunks(ASSERT_BATCH) {
+            let body: Vec<&str> = chunk
+                .iter()
+                .map(|c| c.strip_suffix('.').unwrap_or(c))
+                .collect();
+            let args = json!({
+                "prolog": body,
+                "tag": tag,
+                "namespace": namespace,
+                "skip_embedding": true,
+            });
+
+            let result = self
+                .client
+                .call_tool(TOOL_LOGIC_ASSERT, args)
+                .await
+                .context("logic.assert call failed")?;
+
+            let result = unwrap_mcp_content(result);
+            accepted += result
+                .get("asserted_count")
+                .or_else(|| result.get("count"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(chunk.len() as u64) as usize;
+        }
+
+        Ok(accepted)
+    }
+
+    /// Retract every fact asserted under `tag` in `namespace`.
+    pub async fn forget_tag(&self, namespace: &str, tag: &str) -> Result<()> {
+        self.client
+            .call_tool(
+                TOOL_LOGIC_FORGET,
+                json!({"tag": tag, "namespace": namespace}),
+            )
+            .await
+            .context("logic.forget call failed")?;
+        Ok(())
+    }
+
     /// Run a server-side Prolog query via `invariant.code_query`.
     /// Gives access to advanced queries (intent_mismatches, test_gaps,
     /// security_concerns, hotspots) that require LLM-enriched facts.
+    ///
+    /// With `namespace`, the query runs over the facts `lens` put in that
+    /// logic-cell namespace; without it, over the older per-commit store.
     pub async fn query(
         &self,
         repo_id: &str,
         query: &str,
         commit_sha: Option<&str>,
+        namespace: Option<&str>,
     ) -> Result<serde_json::Value> {
         let mut args = json!({
             "repo_id": repo_id,
@@ -180,13 +258,79 @@ impl Bridge {
             args["commit_sha"] = json!(sha);
         }
 
+        if let Some(ns) = namespace {
+            args["namespace"] = json!(ns);
+        }
+
         let result = self
             .client
             .call_tool(TOOL_CODE_QUERY, args)
             .await
             .context("invariant.code_query call failed")?;
 
-        Ok(unwrap_mcp_content(result))
+        self.unhead(unwrap_mcp_content(result)).await
+    }
+
+    /// DataGrout caps a tool result at a few dozen rows and returns the rest
+    /// as a preview plus a `cache_ref`: a safety valve for agents, whose
+    /// context it protects. The CLI wants every row, so a headed result is
+    /// read back in pages with `frame.slice` and put back under `results`.
+    async fn unhead(&self, result: serde_json::Value) -> Result<serde_json::Value> {
+        let headed = result.get("_headed").and_then(|h| h.as_bool()) == Some(true);
+        let cache_ref = result.get("cache_ref").and_then(|c| c.as_str());
+
+        let (Some(cache_ref), true) = (cache_ref, headed) else {
+            return Ok(result);
+        };
+
+        let total = result
+            .get("record_count")
+            .or_else(|| result.get("count"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0) as usize;
+
+        let mut rows: Vec<serde_json::Value> = Vec::with_capacity(total);
+
+        while rows.len() < total {
+            let page = self
+                .client
+                .call_tool(
+                    TOOL_FRAME_SLICE,
+                    json!({"payload": cache_ref, "offset": rows.len(), "limit": SLICE_PAGE}),
+                )
+                .await
+                .context("frame.slice call failed")?;
+
+            let page = unwrap_mcp_content(page);
+            let records = page
+                .get("records")
+                .or_else(|| page.get("result").and_then(|r| r.get("records")))
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if records.is_empty() {
+                break;
+            }
+            rows.extend(records);
+        }
+
+        let mut full = result;
+        if let Some(obj) = full.as_object_mut() {
+            obj.insert("count".into(), json!(rows.len()));
+            obj.insert("results".into(), serde_json::Value::Array(rows));
+            for key in [
+                "_headed",
+                "_hint",
+                "_answer_from",
+                "preview",
+                "next_tools",
+                "schema",
+            ] {
+                obj.remove(key);
+            }
+        }
+        Ok(full)
     }
 
     /// Analyze code changes for goal alignment via `invariant.diff_analyzer`.
