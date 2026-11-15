@@ -6,6 +6,20 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.3] - 2026-11-14
+
+### Added
+
+- `function_complexity(Id, Cyclomatic, Lines)` for every function in every
+  language, read from the syntax tree: one, plus one for each branch, loop,
+  case arm, catch, ternary and boolean or null-coalescing operator (`&&`,
+  `||`, `and`, `or`, `?:`, `??`) under the function's node; closures count
+  toward the function that holds them.
+  `invariant query hotspots` (fan-in by complexity) now has complexity to rank
+  on without an LLM pass.
+
+---
+
 ## [0.8.2] - 2026-11-11
 
 ### Added

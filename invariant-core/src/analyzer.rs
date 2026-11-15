@@ -196,6 +196,19 @@ fn emit_function(
 
     emit_params(ctx, func_id, fn_node);
 
+    // function_complexity(Id, Cyclomatic, LOC): computed from the syntax tree
+    // for every language, so the hotspot query (fan-in x complexity) works
+    // without an LLM pass.
+    let loc = fn_node.end_position().row - fn_node.start_position().row + 1;
+    ctx.facts.push(Fact::new(
+        "function_complexity",
+        vec![
+            FactValue::String(func_id.to_string()),
+            FactValue::Integer(cyclomatic_complexity(fn_node) as i64),
+            FactValue::Integer(loc as i64),
+        ],
+    ));
+
     if let Some(kind) = test_kind(ctx.filepath, name, fn_node, ctx.code) {
         // test(TestFuncID, TestedFuncID, Kind): what it tests isn't known here,
         // but marking it lets `orphans` stop listing every test as uncalled
@@ -211,6 +224,68 @@ fn emit_function(
     }
 
     ctx.summary.functions += 1;
+}
+
+/// Node kinds that open a branch, across the grammars Invariant lenses.
+const DECISION_KINDS: &[&str] = &[
+    "if_statement",
+    "if_expression",
+    "if_let_expression",
+    "elif_clause",
+    "else_if_clause",
+    "elsif",
+    "if_modifier",
+    "unless",
+    "unless_modifier",
+    "for_statement",
+    "for_in_statement",
+    "for_expression",
+    "foreach_statement",
+    "enhanced_for_statement",
+    "while_statement",
+    "while_expression",
+    "while_modifier",
+    "until",
+    "do_statement",
+    "loop_expression",
+    "case_clause",
+    "switch_case",
+    "switch_label",
+    "switch_section",
+    "case_statement",
+    "when",
+    "match_arm",
+    "expression_case",
+    "type_case",
+    "communication_case",
+    "catch_clause",
+    "except_clause",
+    "rescue",
+    "conditional_expression",
+    "ternary_expression",
+];
+
+/// Boolean operators: each adds a path.
+const DECISION_OPERATORS: &[&str] = &["&&", "||", "and", "or", "?:", "??"];
+
+/// McCabe's cyclomatic complexity: one plus the decision points under the
+/// function's node. Nested closures count toward the function that holds them.
+fn cyclomatic_complexity(fn_node: &Node<'_>) -> usize {
+    let mut count = 1;
+    let mut cursor = fn_node.walk();
+    let mut stack = vec![*fn_node];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        if DECISION_KINDS.contains(&kind)
+            || (!node.is_named() && DECISION_OPERATORS.contains(&kind))
+        {
+            count += 1;
+        }
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    count
 }
 
 /// Whether a function is a test, and which kind: `unit` for a test the runner
@@ -4819,6 +4894,96 @@ fn sanitize_callee(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn facts_of(code: &str, lang: Language, path: &str) -> Vec<String> {
+        let mut analyzer = Analyzer::new().unwrap();
+        analyzer.lens_code(code, lang, path, "abc").unwrap().facts
+    }
+
+    #[test]
+    fn every_function_gets_its_cyclomatic_complexity_and_length() {
+        let code = r#"
+def plain(x):
+    return x
+
+def branchy(xs, limit):
+    total = 0
+    for x in xs:
+        if x > limit and x != 0:
+            total += x
+        elif x < 0:
+            total -= x
+    try:
+        return total
+    except ValueError:
+        return 0
+"#;
+        let facts = facts_of(code, Language::Python, "app/calc.py");
+        let complexity: Vec<&String> = facts
+            .iter()
+            .filter(|f| f.starts_with("function_complexity("))
+            .collect();
+        // plain: 1. branchy: 1 + for + if + and + elif + except = 6, over 11 lines.
+        assert!(
+            complexity
+                .iter()
+                .any(|f| f.contains("plain") && f.contains(", 1, 2)")),
+            "{complexity:?}"
+        );
+        assert!(
+            complexity
+                .iter()
+                .any(|f| f.contains("branchy") && f.contains(", 6, 11)")),
+            "{complexity:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_calls_keep_their_receiver() {
+        let py = facts_of(
+            "import subprocess\n\ndef run_job(cmd):\n    subprocess.run(cmd)\n",
+            Language::Python,
+            "app/jobs.py",
+        );
+        let ts = facts_of(
+            "export function handler(x: number) {\n  console.log(x);\n}\n",
+            Language::TypeScript,
+            "src/web.ts",
+        );
+        let rs = facts_of(
+            "pub fn spawn() {\n    std::process::Command::new(\"ls\");\n}\n",
+            Language::Rust,
+            "src/run.rs",
+        );
+        let calls = |facts: &Vec<String>| {
+            facts
+                .iter()
+                .filter(|f| f.starts_with("calls_external("))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        eprintln!(
+            "py {:?}\nts {:?}\nrs {:?}",
+            calls(&py),
+            calls(&ts),
+            calls(&rs)
+        );
+        assert!(
+            calls(&py).iter().any(|f| f.contains("'subprocess.run'")),
+            "{:?}",
+            calls(&py)
+        );
+        assert!(
+            calls(&ts).iter().any(|f| f.contains("'console.log'")),
+            "{:?}",
+            calls(&ts)
+        );
+        assert!(
+            calls(&rs).iter().any(|f| f.contains("Command::new")),
+            "{:?}",
+            calls(&rs)
+        );
+    }
 
     #[test]
     fn sanitize_callee_produces_clean_single_token() {
