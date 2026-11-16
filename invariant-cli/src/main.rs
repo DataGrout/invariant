@@ -16,6 +16,16 @@ use invariant_core::{
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+mod check;
+
+/// `println!`, or `eprintln!` when stdout is spoken for (an editor hook reads
+/// it as JSON).
+macro_rules! say {
+    ($quiet:expr, $($t:tt)*) => {
+        if $quiet { eprintln!($($t)*) } else { println!($($t)*) }
+    };
+}
+
 #[derive(Parser)]
 #[command(name = "invariant")]
 #[command(about = "Invariant — Semantic code analysis for the AI era", long_about = None)]
@@ -160,6 +170,41 @@ enum Commands {
         output: OutputFormat,
     },
 
+    /// Check a change right after making it: named problems in a few seconds
+    ///
+    /// Lenses the changed files, works out what the change did to their
+    /// functions, and asks DataGrout for the problems: changed code no test
+    /// reaches, untested callers, call sites still using a removed function
+    /// or an old parameter list, security rules, and (with a goal) changes
+    /// that don't serve it. Exits 1 when there are problems.
+    ///   invariant check --goal-ref ABC-123          # working tree vs HEAD
+    ///   invariant check HEAD~1 --goal "..."         # last commit
+    ///   invariant check --hook cursor --goal-ref ABC-123   # Cursor stop hook
+    Check {
+        /// Git revision spec (defaults to the working tree against HEAD)
+        rev: Option<String>,
+
+        /// What the change is for, in words
+        #[arg(long, conflicts_with = "goal_ref")]
+        goal: Option<String>,
+
+        /// A ticket to read the goal from: ABC-123, owner/repo#12, or its URL
+        #[arg(long)]
+        goal_ref: Option<String>,
+
+        /// Run as an editor hook: read the hook's JSON on stdin, print its reply
+        #[arg(long, value_enum)]
+        hook: Option<HookKind>,
+
+        /// Flag a change that reaches more than this many functions
+        #[arg(long)]
+        max_blast_radius: Option<u32>,
+
+        /// Output format
+        #[arg(long, default_value = "text")]
+        output: OutputFormat,
+    },
+
     /// Show connection and configuration status
     Status,
 
@@ -176,6 +221,12 @@ enum Commands {
         #[arg(long)]
         agent: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum HookKind {
+    /// Cursor's `stop` hook: problems go back to the agent as a follow-up
+    Cursor,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -283,6 +334,27 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // A hook runs from wherever the editor starts it; the repository is the
+    // workspace its input names. A hook never blocks the editor: whatever
+    // goes wrong, it answers `{}`.
+    if let Commands::Check {
+        hook: Some(HookKind::Cursor),
+        ..
+    } = &cli.command
+    {
+        let mut stdin = String::new();
+        let _ = std::io::stdin().read_to_string(&mut stdin);
+        let input = check::parse_hook_input(&stdin);
+
+        if input.status.as_deref().is_some_and(|s| s != "completed") {
+            println!("{{}}");
+            return Ok(());
+        }
+        if let Some(root) = &input.workspace_root {
+            let _ = std::env::set_current_dir(root);
+        }
+    }
+
     let project_root = find_project_root();
     let config = Config::load(&project_root);
 
@@ -303,6 +375,7 @@ async fn main() -> Result<()> {
                 namespace,
                 full,
                 enrich,
+                quiet: false,
             };
             cmd_lens(&project_root, &config, opts).await?
         }
@@ -341,6 +414,32 @@ async fn main() -> Result<()> {
         } => {
             let namespace = LensState::lensed_namespace(&project_root.join(".invariant"));
             cmd_review(&config, rev, goal, queries, namespace, output).await?
+        }
+        Commands::Check {
+            rev,
+            goal,
+            goal_ref,
+            hook,
+            max_blast_radius,
+            output,
+        } => {
+            let opts = CheckOpts {
+                rev,
+                goal,
+                goal_ref,
+                hook,
+                max_blast_radius,
+                output,
+            };
+            let hooked = hook.is_some();
+            match cmd_check(&project_root, &config, opts).await {
+                Ok(code) => std::process::exit(code),
+                Err(e) if hooked => {
+                    eprintln!("invariant check: {e:#}");
+                    println!("{{}}");
+                }
+                Err(e) => return Err(e),
+            }
         }
         Commands::Status => cmd_status(&config),
         Commands::Onboard { name, agent } => {
@@ -556,6 +655,8 @@ struct LensOpts {
     namespace: Option<String>,
     full: bool,
     enrich: bool,
+    /// Report on stderr: stdout belongs to a caller reading JSON.
+    quiet: bool,
 }
 
 /// A file `lens` analysed and has yet to upload.
@@ -579,6 +680,7 @@ const UPLOAD_CONCURRENCY: usize = 4;
 /// retracted when the file is gone. Unchanged files cost nothing, and no
 /// source leaves the machine unless `--enrich` asks for LLM intent.
 async fn cmd_lens(project_root: &Path, config: &Config, opts: LensOpts) -> Result<()> {
+    let quiet = opts.quiet;
     let mut analyzer = Analyzer::new()?;
     let bridge = if opts.local_only {
         None
@@ -625,14 +727,16 @@ async fn cmd_lens(project_root: &Path, config: &Config, opts: LensOpts) -> Resul
         });
     }
 
-    println!(
+    say!(
+        quiet,
         "{} {} files...",
         "Analyzing".blue().bold(),
         files_to_lens.len()
     );
-    println!("  {} {}", "Repo:".green(), repo_id);
-    println!("  {} {}", "Namespace:".green(), namespace);
-    println!(
+    say!(quiet, "  {} {}", "Repo:".green(), repo_id);
+    say!(quiet, "  {} {}", "Namespace:".green(), namespace);
+    say!(
+        quiet,
         "  {} {}",
         "Commit:".green(),
         &commit_sha[..std::cmp::min(8, commit_sha.len())]
@@ -802,16 +906,18 @@ async fn cmd_lens(project_root: &Path, config: &Config, opts: LensOpts) -> Resul
         state.save(&invariant_dir)?;
     }
 
-    println!(
+    say!(
+        quiet,
         "{} {} files",
         "Analyzed".green().bold(),
         files_to_lens.len()
     );
-    println!("  Functions: {}", total_functions);
-    println!("  Facts:     {}", total_facts);
+    say!(quiet, "  Functions: {}", total_functions);
+    say!(quiet, "  Facts:     {}", total_facts);
 
     if bridge.is_some() {
-        println!(
+        say!(
+            quiet,
             "  {} {} changed, {} unchanged, {} removed; {} facts into {}",
             "↑".cyan(),
             changed,
@@ -821,21 +927,24 @@ async fn cmd_lens(project_root: &Path, config: &Config, opts: LensOpts) -> Resul
             namespace
         );
         if opts.enrich {
-            println!(
+            say!(
+                quiet,
                 "  {} {} files sent for intent enrichment",
                 "✦".cyan(),
                 enriched
             );
         }
     } else if !opts.local_only {
-        println!(
+        say!(
+            quiet,
             "  {} Run `invariant init` to enable remote analysis",
             "hint:".yellow()
         );
     }
 
     if errors > 0 {
-        println!(
+        say!(
+            quiet,
             "  {} {} files skipped (use -v for details)",
             "⚠".yellow(),
             errors
@@ -848,6 +957,121 @@ async fn cmd_lens(project_root: &Path, config: &Config, opts: LensOpts) -> Resul
 /// A lensed file's path relative to the project root, `/`-separated: the
 /// key for its tag and its recorded hash, so it must not depend on where the
 /// command ran from.
+struct CheckOpts {
+    rev: Option<String>,
+    goal: Option<String>,
+    goal_ref: Option<String>,
+    hook: Option<HookKind>,
+    max_blast_radius: Option<u32>,
+    output: OutputFormat,
+}
+
+/// The dev-loop gate. Returns the exit code: 0 clean, 1 with problems.
+async fn cmd_check(project_root: &Path, config: &Config, opts: CheckOpts) -> Result<i32> {
+    let hooked = opts.hook.is_some();
+
+    let diffs: Vec<FileDiff> = match &opts.rev {
+        Some(rev) => git::diff_from_spec(Some(rev))?,
+        None => git::diff_worktree()?,
+    }
+    .into_iter()
+    .filter(|d| d.language.is_some())
+    .collect();
+
+    if diffs.is_empty() {
+        if hooked {
+            println!("{{}}");
+        } else {
+            println!("No changed source files to check.");
+        }
+        return Ok(0);
+    }
+
+    // The server reads the namespace, so it must hold the changed files as
+    // they are now. Only changed files are re-lensed.
+    let paths: Vec<PathBuf> = diffs
+        .iter()
+        .filter(|d| d.after.is_some())
+        .map(|d| project_root.join(&d.path))
+        .filter(|p| p.exists())
+        .collect();
+    if !paths.is_empty() {
+        let lens = LensOpts {
+            paths,
+            language_filter: None,
+            local_only: false,
+            namespace: None,
+            full: false,
+            enrich: false,
+            quiet: true,
+        };
+        cmd_lens(project_root, config, lens).await?;
+    }
+
+    let (repo_id, _) = detect_repo_context();
+    let repo_id = config.repo_id.clone().unwrap_or(repo_id);
+    let namespace = LensState::lensed_namespace(&project_root.join(".invariant"))
+        .unwrap_or_else(|| code_namespace(&repo_id));
+
+    let mut analyzer = Analyzer::new()?;
+    let files: Vec<check::FileChange> = diffs
+        .iter()
+        .filter_map(|d| {
+            d.language.map(|lang| {
+                check::file_change(
+                    &mut analyzer,
+                    &d.path,
+                    lang,
+                    d.before.as_deref(),
+                    d.after.as_deref(),
+                )
+            })
+        })
+        .collect();
+
+    let args = check::check_args(
+        &namespace,
+        &files,
+        opts.goal.as_deref(),
+        opts.goal_ref.as_deref(),
+        opts.max_blast_radius,
+    );
+
+    let bridge = require_bridge(config).await?;
+    let result = bridge.check(args).await?;
+    let problems = check::problem_lines(&result);
+
+    if hooked {
+        println!("{}", check::cursor_hook_output(&result));
+        return Ok(0);
+    }
+
+    match opts.output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Text => {
+            if let Some(goal) = result["goal"]["text"].as_str() {
+                println!("{} {}", "Goal:".green(), goal.lines().next().unwrap_or(""));
+            } else if let Some(note) = result["goal"]["note"].as_str() {
+                println!("{} {}", "Goal:".yellow(), note);
+            }
+            if problems.is_empty() {
+                println!(
+                    "{} {}",
+                    "✓".green(),
+                    result["summary"].as_str().unwrap_or("Clean.")
+                );
+            } else {
+                for line in &problems {
+                    println!("  {} {}", "✗".red(), line);
+                }
+                println!("{}", result["summary"].as_str().unwrap_or(""));
+            }
+        }
+    }
+
+    Ok(if problems.is_empty() { 0 } else { 1 })
+}
+
 fn relative_path(project_root: &Path, file: &Path) -> String {
     let root = project_root
         .canonicalize()

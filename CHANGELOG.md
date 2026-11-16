@@ -6,6 +6,24 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- `invariant check [REV] (--goal TEXT | --goal-ref REF)`: a dev-loop gate.
+  Lenses the changed files (working tree against HEAD by default), finds the
+  functions each change removed or whose parameter count changed by analysing
+  the file before and after, and asks DataGrout's `invariant.check` for named
+  problems: untested changes, untested callers, missed call sites, policy
+  failures and, with a goal, changes that don't serve it. Exits 1 when there
+  are problems. `--hook cursor` runs it as Cursor's `stop` hook, answering
+  with a follow-up for the agent only when there is something to fix.
+- `git::diff_worktree()`: the working tree, staged or not, against HEAD,
+  untracked files included.
+- `Bridge::check`.
+
+---
+
 ## [0.8.3] - 2026-11-14
 
 ### Added
