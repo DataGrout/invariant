@@ -16,11 +16,15 @@ use std::collections::BTreeMap;
 pub struct Touched {
     pub ranges: Vec<(u32, u32)>,
     pub deletions: Vec<u32>,
+    /// Deletions whose removed lines were decorators or attributes (`@login_required`,
+    /// `#[cfg(test)]`): the gap before the function they decorated.
+    pub decorator_deletions: Vec<u32>,
 }
 
 pub fn changed_ranges(before: &str, after: &str) -> Touched {
     let mut lines: Vec<u32> = Vec::new();
     let mut deletions: Vec<u32> = Vec::new();
+    let mut decorator_deletions: Vec<u32> = Vec::new();
 
     if let Ok(patch) =
         git2::Patch::from_buffers(before.as_bytes(), None, after.as_bytes(), None, None)
@@ -42,7 +46,12 @@ pub fn changed_ranges(before: &str, after: &str) -> Touched {
                             next_new = n + 1;
                         }
                     }
-                    '-' => deletions.push(next_new),
+                    '-' => {
+                        deletions.push(next_new);
+                        if is_decorator(&String::from_utf8_lossy(line.content())) {
+                            decorator_deletions.push(next_new);
+                        }
+                    }
                     ' ' => {
                         if let Some(n) = line.new_lineno() {
                             next_new = n + 1;
@@ -56,10 +65,92 @@ pub fn changed_ranges(before: &str, after: &str) -> Touched {
 
     deletions.sort_unstable();
     deletions.dedup();
+    decorator_deletions.sort_unstable();
+    decorator_deletions.dedup();
     Touched {
         ranges: to_ranges(lines),
         deletions,
+        decorator_deletions,
     }
+}
+
+fn is_decorator(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with('@') || t.starts_with("#[")
+}
+
+fn indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// The decorator or attribute lines directly above a function that starts at
+/// `def_line` (1-based), as an inclusive range, multi-line decorators included.
+/// The analyzer's function starts at its `def`, so without this a change that
+/// only adds or removes a decorator (an authentication check, say) touches no
+/// function and the gate stays silent.
+fn decorator_block(lines: &[&str], def_line: u32) -> Option<(u32, u32)> {
+    let d = def_line as usize;
+    if d < 2 || d > lines.len() {
+        return None;
+    }
+    let def_indent = indent(lines[d - 1]);
+    let mut top: Option<usize> = None;
+    let mut i = d - 1;
+    while i >= 1 {
+        let line = lines[i - 1];
+        let t = line.trim();
+        if t.is_empty() {
+            break;
+        }
+        if is_decorator(line) {
+            top = Some(i);
+        } else if !(indent(line) > def_indent || t.starts_with(')') || t.starts_with(']')) {
+            break;
+        }
+        i -= 1;
+    }
+    top.map(|t| (t as u32, def_line - 1))
+}
+
+/// Counts a change to a function's decorators as a change to the function: adds
+/// its `def` line when a changed line falls in the decorator block above it, or
+/// a removed decorator left its gap there.
+pub fn with_decorated_functions(mut touched: Touched, after: &str, def_lines: &[u32]) -> Touched {
+    let lines: Vec<&str> = after.lines().collect();
+    let mut extra: Vec<u32> = Vec::new();
+
+    for &d in def_lines {
+        let block = decorator_block(&lines, d);
+        let edited =
+            block.is_some_and(|(b, e)| touched.ranges.iter().any(|&(s, t)| s <= e && t >= b));
+        let removed = touched
+            .decorator_deletions
+            .iter()
+            .any(|&p| p == d || block.is_some_and(|(b, _)| p >= b && p <= d));
+        if edited || removed {
+            extra.push(d);
+        }
+    }
+
+    if !extra.is_empty() {
+        let mut all: Vec<u32> = touched.ranges.iter().flat_map(|&(s, e)| s..=e).collect();
+        all.extend(extra);
+        touched.ranges = to_ranges(all);
+    }
+    touched
+}
+
+/// The start lines of the functions in a file's facts (`function/7`'s sixth
+/// argument).
+pub fn function_lines(facts: &[String]) -> Vec<u32> {
+    facts
+        .iter()
+        .filter_map(|f| {
+            let body = f.strip_prefix("function(")?;
+            let args = split_args(body.trim_end_matches('.').trim_end_matches(')'));
+            args.get(5)?.trim().parse().ok()
+        })
+        .collect()
 }
 
 fn to_ranges(mut lines: Vec<u32>) -> Vec<(u32, u32)> {
@@ -206,22 +297,29 @@ pub fn file_change(
     before: Option<&str>,
     after: Option<&str>,
 ) -> FileChange {
-    let facts = |analyzer: &mut Analyzer, code: Option<&str>| -> Vec<FunctionShape> {
+    let facts = |analyzer: &mut Analyzer, code: Option<&str>| -> Vec<String> {
         code.and_then(|c| analyzer.lens_code(c, language, path, "check").ok())
-            .map(|r| function_shapes(&r.facts))
+            .map(|r| r.facts)
             .unwrap_or_default()
     };
 
-    let before_shapes = facts(analyzer, before);
-    let after_shapes = facts(analyzer, after);
+    let before_facts = facts(analyzer, before);
+    let after_facts = facts(analyzer, after);
 
     FileChange {
         path: path.to_string(),
         touched: match after {
-            Some(a) => changed_ranges(before.unwrap_or(""), a),
+            Some(a) => with_decorated_functions(
+                changed_ranges(before.unwrap_or(""), a),
+                a,
+                &function_lines(&after_facts),
+            ),
             None => Touched::default(),
         },
-        shapes: shape_changes(&before_shapes, &after_shapes),
+        shapes: shape_changes(
+            &function_shapes(&before_facts),
+            &function_shapes(&after_facts),
+        ),
     }
 }
 
@@ -351,8 +449,58 @@ mod tests {
             Touched {
                 ranges: vec![(2, 2), (4, 4)],
                 deletions: vec![2, 6],
+                decorator_deletions: vec![],
             }
         );
+    }
+
+    fn decorated(before: &str, after: &str) -> Vec<(u32, u32)> {
+        let mut analyzer = Analyzer::new().unwrap();
+        let facts = analyzer
+            .lens_code(after, Language::Python, "app/views.py", "check")
+            .unwrap()
+            .facts;
+        with_decorated_functions(
+            changed_ranges(before, after),
+            after,
+            &function_lines(&facts),
+        )
+        .ranges
+    }
+
+    #[test]
+    fn removing_a_decorator_touches_the_function_it_decorated() {
+        let before = "def a():\n    return 1\n\n@login_required\ndef view():\n    return 2\n";
+        let after = "def a():\n    return 1\n\ndef view():\n    return 2\n";
+        // Only a deletion, credited to the gap before line 4: `view`'s def.
+        assert_eq!(decorated(before, after), vec![(4, 4)]);
+    }
+
+    #[test]
+    fn adding_or_editing_a_decorator_touches_the_function() {
+        let before = "def view():\n    return 2\n";
+        let after = "@login_required\ndef view():\n    return 2\n";
+        assert_eq!(decorated(before, after), vec![(1, 2)]);
+
+        let before = "@app.route(\n    \"/a\",\n)\ndef view():\n    return 2\n";
+        let after = "@app.route(\n    \"/b\",\n)\ndef view():\n    return 2\n";
+        // The edit is inside a multi-line decorator, three lines above the def.
+        assert_eq!(decorated(before, after), vec![(2, 2), (4, 4)]);
+    }
+
+    #[test]
+    fn a_plain_deletion_before_a_function_does_not_touch_it() {
+        let before = "def a():\n    x = 1\n    return x\ndef b():\n    return 2\n";
+        let after = "def a():\n    x = 1\ndef b():\n    return 2\n";
+        // `return x` came off a's end; b's def is not credited.
+        assert_eq!(decorated(before, after), vec![]);
+    }
+
+    #[test]
+    fn rust_attributes_count_as_decorators() {
+        let lines = vec!["#[cfg(test)]", "#[inline]", "fn f() {}"];
+        assert_eq!(decorator_block(&lines, 3), Some((1, 2)));
+        assert_eq!(decorator_block(&["fn f() {}"], 1), None);
     }
 
     #[test]
@@ -433,6 +581,7 @@ mod tests {
             touched: Touched {
                 ranges: vec![(2, 3)],
                 deletions: vec![5],
+                decorator_deletions: vec![],
             },
             shapes: ShapeChanges {
                 removed: vec!["old".into()],
