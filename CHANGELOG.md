@@ -18,6 +18,10 @@ This project follows [Semantic Versioning](https://semver.org/).
   failures and, with a goal, changes that don't serve it. Exits 1 when there
   are problems. `--hook cursor` runs it as Cursor's `stop` hook, answering
   with a follow-up for the agent only when there is something to fix.
+- `invariant check` counts a change to a function's decorators or attributes
+  (adding, editing or removing `@login_required`, `#[cfg(test)]` and the like,
+  multi-line decorators included) as a change to that function, so removing an
+  authentication decorator is checked like any other edit to it.
 - `git::diff_worktree()`: the working tree, staged or not, against HEAD,
   untracked files included.
 - `Bridge::check`.
