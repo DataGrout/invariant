@@ -18,6 +18,7 @@ use serde_json::json;
 const TOOL_CODE_LENS: &str = "data-grout@1/invariant.code_lens@1";
 const TOOL_CODE_QUERY: &str = "data-grout@1/invariant.code_query@1";
 const TOOL_DIFF_ANALYZER: &str = "data-grout@1/invariant.diff_analyzer@1";
+const TOOL_CHECK: &str = "data-grout@1/invariant.check@1";
 const TOOL_LOGIC_ASSERT: &str = "data-grout@1/logic.assert@1";
 const TOOL_LOGIC_FORGET: &str = "data-grout@1/logic.forget@1";
 const TOOL_FRAME_SLICE: &str = "data-grout@1/frame.slice@1";
@@ -383,5 +384,18 @@ impl Bridge {
 
         let analysis: DiffAnalysis = serde_json::from_value(unwrap_mcp_content(result))?;
         Ok(analysis)
+    }
+
+    /// Check a change against the namespace it was lensed into
+    /// (`invariant.check`): the named problems, the changed functions, the goal
+    /// used and the timings, as the server returns them.
+    pub async fn check(&self, args: serde_json::Value) -> Result<serde_json::Value> {
+        let result = self
+            .client
+            .call_tool(TOOL_CHECK, args)
+            .await
+            .context("invariant.check call failed")?;
+
+        Ok(unwrap_mcp_content(result))
     }
 }

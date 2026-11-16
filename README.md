@@ -43,6 +43,9 @@ invariant diff main..HEAD --goal "refactor auth"              # branch diff
 
 # One-shot review: lens + diff + query on changed files
 invariant review --goal "add rate limiting"
+
+# Check each change (a dev-loop gate): named problems in seconds, exit 1 if any
+invariant check --goal-ref ABC-123                             # working tree vs HEAD
 ```
 
 After the first `invariant init`, Invariant prefers a persisted mTLS identity in `~/.conduit/`. If the gateway rejects identity bootstrap, Invariant falls back to the saved bearer token so subsequent runs still authenticate automatically.
@@ -140,6 +143,38 @@ invariant query table_access --filter Sales.Orders   # Which procedures read and
 invariant query routes               # HTTP routes from ASP.NET and Spring, with their auth annotations
 invariant query annotations --filter Authorize       # Everything carrying an annotation
 invariant query dependencies --filter Newtonsoft.Json # What depends on a package
+```
+
+### `invariant check`
+
+Check a change right after making it. Lenses the changed files, works out what
+the change did to their functions by analysing each file before and after, and
+asks DataGrout's `invariant.check` for the problems:
+
+- **untested_change**: a changed function no test reaches
+- **untested_callers**: callers of a changed function with no test of their own
+- **missed_call_sites**: a removed function, or one whose parameter count
+  changed, still called the old way
+- **policy**: a security rule a changed function trips, or (with
+  `--max-blast-radius N`) a change reaching more than N functions
+- **off_goal**: with `--goal` or `--goal-ref`, changes that don't serve it
+
+```bash
+invariant check --goal-ref ABC-123            # working tree vs HEAD; ticket from any connected system
+invariant check HEAD~1 --goal "add retries"   # a commit
+invariant check --output json                 # the server's full answer
+```
+
+It exits 1 when there are problems. As a Cursor `stop` hook it reads the
+hook's input and hands the problems back to the agent as a follow-up:
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "stop": [{ "command": "invariant check --hook cursor --goal-ref ABC-123", "timeout": 60 }]
+  }
+}
 ```
 
 ### `invariant diff`

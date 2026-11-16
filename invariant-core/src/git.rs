@@ -163,6 +163,24 @@ pub fn diff_staged() -> Result<Vec<FileDiff>> {
     extract_file_diffs(&repo, &diff)
 }
 
+/// Diff the working tree, staged or not, against HEAD, untracked files
+/// included: what an editor agent has changed since the last commit.
+pub fn diff_worktree() -> Result<Vec<FileDiff>> {
+    let repo = discover_repo()?;
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+
+    let mut opts = DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
+
+    let diff = repo
+        .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))
+        .context("Failed to diff the working tree against HEAD")?;
+
+    extract_file_diffs(&repo, &diff)
+}
+
 /// Diff a single commit against its parent(s).
 pub fn diff_commit(rev: &str) -> Result<Vec<FileDiff>> {
     let repo = discover_repo()?;
@@ -275,7 +293,7 @@ fn extract_file_diffs(repo: &Repository, diff: &git2::Diff<'_>) -> Result<Vec<Fi
             Delta::Deleted => DiffStatus::Deleted,
             Delta::Modified => DiffStatus::Modified,
             Delta::Renamed => DiffStatus::Renamed,
-            Delta::Copied => DiffStatus::Added,
+            Delta::Copied | Delta::Untracked => DiffStatus::Added,
             _ => continue,
         };
 
